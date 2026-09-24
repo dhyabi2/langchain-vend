@@ -12,6 +12,7 @@ license = { text = "MIT" }
 dependencies = [
     "langchain-core>=0.3",
     "httpx>=0.25",
+    "pydantic-ai>=2.47.0",
 ]
 
 [project.optional-dependencies]

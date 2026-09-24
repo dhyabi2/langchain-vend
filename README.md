@@ -10,7 +10,7 @@ server answers.
 ## Install
 
 ```bash
-pip install "langchain-vend[live] @ git+https://github.com/PANDeveloper001/langchain-vend.git"
+pip install "langchain-vend[live] @ git+https://github.com/dhyabi2/langchain-vend.git"
 ```
 
 (base install is `git+...langchain-vend.git`; the `[live]` extra adds `nano_pay` for
