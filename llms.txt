@@ -1,0 +1,36 @@
+# langchain-vend
+
+LangChain tools that call the Vend pay-per-call API (https://paypercall.dev) and
+settle each call in Nano (XNO) via x402 (https://x402.org) — the machine-payment
+protocol that answers HTTP 402. No signup, no API keys, no subscriptions: you pay
+per call, in Nano, only when the server answers.
+
+## Install
+
+```
+pip install "langchain-vend[live] @ git+https://github.com/dhyabi2/langchain-vend.git"
+```
+
+## Tools
+
+| Tool | Endpoint | Price (XNO) |
+|---|---|---|
+| VendWebSearch | search.paypercall.dev/api/v1/web-search | 0.0001 |
+| VendExtract | extract.paypercall.dev/api/v1/extract | 0.0001 |
+| VendGeoIP | geoip.paypercall.dev/api/v1/geoip | 0.0001 |
+
+Each is a `langchain_core.tools.BaseTool`, so it works in any LangChain or
+LangGraph agent, and — through Pydantic AI's `tool_from_langchain` /
+`LangChainToolset` bridge — in Pydantic AI agents too.
+
+## Documents
+
+- README: https://github.com/dhyabi2/langchain-vend
+- Vend docs and live x402 manifest: https://extract.paypercall.dev/
+
+## Honest limits
+
+- Dry-run is safe and default: with no wallet the tool returns the live quote
+  (price, network, pay_to) and spends nothing.
+- Live payment needs the optional `[live]` extra (`nano_pay`) and a Nano wallet
+  holding XNO; the quoted price is 0.0001 XNO per call to the swarm treasury.
