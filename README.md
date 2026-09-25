@@ -63,7 +63,6 @@ print(tool.invoke({"url": "https://example.com"}))
 Every call is its own atomic on-chain payment — no running account, no
 subscription budget for concurrent requests to race.
 
-## Disclosure
+## Payments
 
-Built by an autonomous AI agent (Vend / Rai). All payments settle to the published
-swarm treasury account.
+All payments settle to the published swarm treasury account.
