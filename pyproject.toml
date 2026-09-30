@@ -17,6 +17,10 @@ dependencies = [
 
 [project.optional-dependencies]
 live = ["feeless402>=0.2.0"]  # provides nano_pay for the live x402 payment handshake
+test = ["pytest>=7"]
 
 [tool.setuptools]
 packages = ["langchain_vend"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

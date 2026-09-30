@@ -40,6 +40,7 @@ from langchain_vend import VendWebSearch, VendExtract, VendGeoIP
 tool = VendWebSearch()
 result = tool.invoke({"q": "nano cryptocurrency"})
 # {"requires_payment": true, "price_xno": "0.0001",
+#  "amount_raw": "100000000000000000000000000",
 #  "network": "nano:mainnet", "pay_to": "nano_1yo6..."}
 ```
 
