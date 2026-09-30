@@ -28,6 +28,7 @@ Usage (live): pass a wallet that can sign Nano blocks.
 
 import json
 import os
+from decimal import Decimal
 from typing import Any, Dict, Optional
 
 import httpx
@@ -47,15 +48,88 @@ VEND_ENDPOINTS = {
 }
 
 
+#: 1 XNO = 10**30 raw. x402 quotes `accepts[].amount` in raw, as an integer
+#: string; raw is the only exact representation, so it is what we carry.
+RAW_PER_XNO = 10 ** 30
+
+
+def raw_to_xno(raw: int) -> str:
+    """Integer raw -> exact decimal XNO string. Never a float: at 10**30 raw to
+    the XNO, binary floating point cannot hold a price exactly."""
+    raw = int(raw)
+    if raw < 0:
+        raise ValueError("raw must not be negative")
+    whole, frac = divmod(raw, RAW_PER_XNO)
+    if frac == 0:
+        return str(whole)
+    return "%d.%s" % (whole, str(frac).zfill(30).rstrip("0"))
+
+
+def _payable(accept: Any) -> bool:
+    """Only the `exact` scheme on `nano:mainnet` in XNO is a price we can quote.
+    A USDC offer on another network is somebody else's rail, not a cheaper XNO."""
+    return (
+        isinstance(accept, dict)
+        and (accept.get("scheme"), accept.get("network"), accept.get("asset"))
+        == ("exact", "nano:mainnet", "XNO")
+    )
+
+
+def _pay_to_of(accept: Dict[str, Any]) -> Optional[str]:
+    pay_to = accept.get("payTo")
+    if isinstance(pay_to, list):
+        return (pay_to or [None])[0]
+    return pay_to
+
+
 def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
+    """The price an agent reads before it decides to pay.
+
+    `accepts[].amount` is integer RAW, not XNO -- reporting it as `price_xno`
+    overstates the price by a factor of 10**30. The price is therefore derived
+    from the raw amount of the first payable Nano offer. Vend also sends a
+    convenience `price_xno` JSON number; it is used only when no offer carries
+    a usable raw amount, and is rendered through `Decimal(str(...))` so the
+    quote leaving this function is never a float.
+    """
     accepts = challenge.get("accepts") or []
-    a0 = accepts[0] if accepts else {}
+    offer = next((a for a in accepts if _payable(a)), None)
+    if offer is not None:
+        a0 = offer
+    elif accepts and isinstance(accepts[0], dict):
+        a0 = accepts[0]  # nothing payable: report what the seller actually asked for
+    else:
+        a0 = {}
+
+    amount_raw = None
+    price_xno = None
+    if offer is not None:
+        amount = offer.get("amount")
+        if isinstance(amount, str) and amount.strip().isdigit() and int(amount) > 0:
+            amount_raw = str(int(amount))
+            price_xno = raw_to_xno(int(amount_raw))
+        elif isinstance(amount, int) and amount > 0:
+            amount_raw = str(amount)
+            price_xno = raw_to_xno(amount)
+
+    if price_xno is None and challenge.get("price_xno") is not None:
+        # Vend's own field, in XNO. Read through str() so 0.0001 stays 0.0001.
+        try:
+            xno = Decimal(str(challenge["price_xno"]))
+            raw = xno * RAW_PER_XNO
+            if xno >= 0 and raw == raw.to_integral_value():
+                amount_raw = str(int(raw))
+                price_xno = raw_to_xno(int(amount_raw))
+        except Exception:  # decimal.InvalidOperation and friends
+            pass
+
     return {
-        "price_xno": challenge.get("price_xno") or a0.get("amount"),
-        "asset": a0.get("asset", "XNO"),
-        "network": a0.get("network", "nano:mainnet"),
-        "pay_to": (a0.get("payTo") or [None])[0] if isinstance(a0.get("payTo"), list) else a0.get("payTo"),
-        "scheme": a0.get("scheme", "exact"),
+        "price_xno": price_xno,
+        "amount_raw": amount_raw,
+        "asset": a0.get("asset"),
+        "network": a0.get("network"),
+        "pay_to": _pay_to_of(a0),
+        "scheme": a0.get("scheme"),
     }
 
 
@@ -99,9 +173,11 @@ class _VendTool(BaseTool):
         return json.dumps({
             "requires_payment": True,
             "price_xno": q.get("price_xno"),
+            "amount_raw": q.get("amount_raw"),
             "network": q.get("network"),
             "pay_to": q.get("pay_to"),
-            "note": "Send this amount to pay_to, then retry with the block hash in X-PAYMENT.",
+            "note": "Send exactly amount_raw (integer raw; 1 XNO = 10**30 raw) to pay_to, "
+                    "then retry with the block hash in X-PAYMENT.",
         })
 
 
@@ -152,4 +228,5 @@ class VendGeoIP(_VendTool):
     _endpoint: str = VEND_ENDPOINTS["geoip"][0]
 
 
-__all__ = ["VendWebSearch", "VendExtract", "VendGeoIP", "Vend402Quote", "VEND_TREASURY_DEFAULT"]
+__all__ = ["VendWebSearch", "VendExtract", "VendGeoIP", "Vend402Quote", "VEND_TREASURY_DEFAULT",
+           "RAW_PER_XNO", "raw_to_xno"]
