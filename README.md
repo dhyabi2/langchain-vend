@@ -44,16 +44,24 @@ result = tool.invoke({"q": "nano cryptocurrency"})
 #  "network": "nano:mainnet", "pay_to": "nano_1yo6..."}
 ```
 
-Live (pays on the call):
+Live (pays on the call): pass a wallet. `nano_pay.wallet.Wallet` takes a file
+path, not a seed — the seed lives in that file.
 
 ```python
 from nano_pay.wallet import Wallet
 from langchain_vend import VendExtract
 
-w = Wallet(seed="...")
+w = Wallet()                              # ~/.nano-pay/wallet.json
+w.load() if w.exists() else w.create()    # create() takes an optional seed
 tool = VendExtract(wallet=w)
 print(tool.invoke({"url": "https://example.com"}))
+# {"result": {...the answer...},
+#  "payment": {"amount_xno": "0.0001", "block": "...", "settled": true}}
 ```
+
+The spend cap is the quoted amount itself: a seller that asks for more on the
+paying call is refused, not paid. Hold a wallet and still only read the price
+with `VendExtract(wallet=w, dry_run=True)`.
 
 ## How payment works (x402)
 
