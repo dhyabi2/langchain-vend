@@ -39,19 +39,25 @@ from langchain_vend import VendWebSearch, VendExtract, VendGeoIP
 
 tool = VendWebSearch()
 result = tool.invoke({"q": "nano cryptocurrency"})
-# {"requires_payment": true, "price_xno": "0.0001",
-#  "amount_raw": "100000000000000000000000000",
-#  "network": "nano:mainnet", "pay_to": "nano_1yo6..."}
+# {"requires_payment": true, "payable_in_xno": true, "price_xno": "0.0001",
+#  "amount_raw": "100000000000000000000000000", "asset": "XNO",
+#  "network": "nano:mainnet", "scheme": "exact", "pay_to": "nano_1yo6..."}
 ```
 
-Live (pays on the call):
+`payable_in_xno` is false when the 402 asks for some other rail. The quote then
+carries no `amount_raw` and no price, and an agent must send nothing: `asset`
+and `network` say what the seller actually wanted.
+
+Live (pays on the call). A wallet alone is not enough: `dry_run` defaults to
+`True`, so `VendExtract(wallet=w)` still returns the quote and spends nothing.
+Paying is opt-in, and `dry_run=False` is how you opt in.
 
 ```python
 from nano_pay.wallet import Wallet
 from langchain_vend import VendExtract
 
 w = Wallet(seed="...")
-tool = VendExtract(wallet=w)
+tool = VendExtract(wallet=w, dry_run=False)   # dry_run=False is what spends
 print(tool.invoke({"url": "https://example.com"}))
 ```
 
