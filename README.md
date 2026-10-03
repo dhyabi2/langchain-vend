@@ -48,9 +48,10 @@ result = tool.invoke({"q": "nano cryptocurrency"})
 carries no `amount_raw` and no price, and an agent must send nothing: `asset`
 and `network` say what the seller actually wanted.
 
-Live (pays on the call): pass a wallet. `nano_pay.wallet.Wallet` takes a file
-path, not a seed — the seed lives in that file. Hold a wallet and still only
-read the price with `dry_run=True`.
+Live (pays on the call). A wallet alone is not enough: `dry_run` defaults to
+`True`, so `VendExtract(wallet=w)` still returns the quote and spends nothing.
+Paying is opt-in, and `dry_run=False` is how you opt in. `nano_pay.wallet.Wallet`
+takes a file path, not a seed — the seed lives in that file.
 
 ```python
 from nano_pay.wallet import Wallet
@@ -58,7 +59,7 @@ from langchain_vend import VendExtract
 
 w = Wallet()                              # ~/.nano-pay/wallet.json
 w.load() if w.exists() else w.create()    # create() takes an optional seed
-tool = VendExtract(wallet=w)
+tool = VendExtract(wallet=w, dry_run=False)   # dry_run=False is what spends
 print(tool.invoke({"url": "https://example.com"}))
 # {"result": {...the answer...},
 #  "payment": {"amount_xno": "0.0001", "block": "...", "settled": true}}

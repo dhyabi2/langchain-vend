@@ -90,14 +90,14 @@ def paid_calls(monkeypatch):
 
 
 def test_a_wallet_pays_the_quote_and_returns_the_answer(paid_calls):
-    out = json.loads(VendWebSearch(wallet=_Wallet()).invoke({"q": "nano cryptocurrency"}))
+    out = json.loads(VendWebSearch(wallet=_Wallet(), dry_run=False).invoke({"q": "nano cryptocurrency"}))
     assert len(paid_calls) == 1, "a tool holding a wallet never attempted the payment"
     assert out["result"] == ANSWER, "the paid-for answer did not reach the caller"
     assert out["payment"]["block"] == RECEIPT["block"], "the settlement receipt was dropped"
 
 
 def test_the_payment_call_matches_the_nano_pay_entry_point(paid_calls):
-    VendWebSearch(wallet=_Wallet()).invoke({"q": "nano cryptocurrency"})
+    VendWebSearch(wallet=_Wallet(), dry_run=False).invoke({"q": "nano cryptocurrency"})
     call = paid_calls[0]
     assert call["method"] == "GET"
     assert call["url"] == "https://search.paypercall.dev/api/v1/web-search"
@@ -106,7 +106,7 @@ def test_the_payment_call_matches_the_nano_pay_entry_point(paid_calls):
 
 
 def test_the_spend_cap_is_the_exact_raw_amount_quoted(paid_calls):
-    VendWebSearch(wallet=_Wallet()).invoke({"q": "nano cryptocurrency"})
+    VendWebSearch(wallet=_Wallet(), dry_run=False).invoke({"q": "nano cryptocurrency"})
     cap = paid_calls[0]["max_raw"]
     assert isinstance(cap, int) and not isinstance(cap, bool), "a cap on an XNO amount must be integer raw"
     assert cap == int(PRICE_RAW) == RAW_PER_XNO // 10_000
@@ -129,5 +129,5 @@ def test_a_402_with_no_payable_xno_offer_is_refused_not_paid(paid_calls, monkeyp
     usdc_only = {"accepts": [{"scheme": "exact", "network": "base", "asset": "USDC", "amount": "1000"}]}
     monkeypatch.setattr(httpx, "get", lambda *a, **k: _Resp(402, usdc_only))
     with pytest.raises(RuntimeError, match="no payable XNO offer"):
-        VendWebSearch(wallet=_Wallet()).invoke({"q": "nano"})
+        VendWebSearch(wallet=_Wallet(), dry_run=False).invoke({"q": "nano"})
     assert paid_calls == [], "paid against a 402 that quoted no XNO amount"

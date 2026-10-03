@@ -21,7 +21,7 @@ Usage (dry-run: read prices / prove the endpoint answers, spend nothing):
 
 Usage (live): pass a wallet that can sign Nano blocks AND opt in with
 dry_run=False. A wallet on its own leaves the tool in dry-run, quoting and
-spending nothing.
+spending nothing: paying is opt-in and this branch does not change that.
     from nano_pay.wallet import Wallet
     w = Wallet()                         # ~/.nano-pay/wallet.json
     w.load() if w.exists() else w.create()
@@ -158,7 +158,7 @@ class _VendTool(BaseTool):
     wallet: Optional[Any] = None
     #: Nano RPC used to sign and settle; defaults to `nano_pay.rpc.RPC()`.
     rpc: Optional[Any] = None
-    dry_run: bool = False
+    dry_run: bool = True
 
     def _call_vend(self, **params) -> Dict[str, Any]:
         url = self._endpoint
