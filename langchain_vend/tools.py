@@ -19,7 +19,9 @@ Usage (dry-run: read prices / prove the endpoint answers, spend nothing):
     tool = VendWebSearch()               # no wallet -> _arun returns the quote
     print(await tool.ainvoke({"q": "nano cryptocurrency"}))
 
-Usage (live): pass a wallet that can sign Nano blocks.
+Usage (live): pass a wallet that can sign Nano blocks AND opt in with
+dry_run=False. A wallet on its own leaves the tool in dry-run, quoting and
+spending nothing.
     from nano_pay.wallet import Wallet
     w = Wallet()                         # ~/.nano-pay/wallet.json
     w.load() if w.exists() else w.create()
@@ -89,9 +91,15 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
     `accepts[].amount` is integer RAW, not XNO -- reporting it as `price_xno`
     overstates the price by a factor of 10**30. The price is therefore derived
     from the raw amount of the first payable Nano offer. Vend also sends a
-    convenience `price_xno` JSON number; it is used only when no offer carries
-    a usable raw amount, and is rendered through `Decimal(str(...))` so the
-    quote leaving this function is never a float.
+    convenience `price_xno` JSON number; it is used only when a payable Nano
+    offer exists but carries no usable raw amount, and is rendered through
+    `Decimal(str(...))` so the quote leaving this function is never a float.
+
+    A priced quote always comes from one payable Nano offer, so `amount_raw`
+    and `pay_to` describe the same offer. Without such an offer the quote is
+    unpriced (`payable` False): a seller that asks for USDC on another network
+    must not be handed an XNO amount to send, even when the body happens to
+    carry a `price_xno` field as well.
     """
     accepts = challenge.get("accepts") or []
     offer = next((a for a in accepts if _payable(a)), None)
@@ -113,8 +121,10 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
             amount_raw = str(amount)
             price_xno = raw_to_xno(amount)
 
-    if price_xno is None and challenge.get("price_xno") is not None:
+    if offer is not None and price_xno is None and challenge.get("price_xno") is not None:
         # Vend's own field, in XNO. Read through str() so 0.0001 stays 0.0001.
+        # Only reachable with a payable Nano offer in hand, so the amount it
+        # yields belongs to the destination reported below.
         try:
             xno = Decimal(str(challenge["price_xno"]))
             raw = xno * RAW_PER_XNO
@@ -131,6 +141,7 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
         "network": a0.get("network"),
         "pay_to": _pay_to_of(a0),
         "scheme": a0.get("scheme"),
+        "payable": offer is not None and amount_raw is not None,
     }
 
 
@@ -200,14 +211,23 @@ class _VendTool(BaseTool):
 
     @staticmethod
     def _quote_json(q: Dict[str, Any]) -> str:
+        payable = bool(q.get("payable"))
         return json.dumps({
             "requires_payment": True,
+            "payable_in_xno": payable,
             "price_xno": q.get("price_xno"),
             "amount_raw": q.get("amount_raw"),
+            "asset": q.get("asset"),
             "network": q.get("network"),
+            "scheme": q.get("scheme"),
             "pay_to": q.get("pay_to"),
-            "note": "Send exactly amount_raw (integer raw; 1 XNO = 10**30 raw) to pay_to, "
-                    "then retry with the block hash in X-PAYMENT.",
+            "note": (
+                "Send exactly amount_raw (integer raw; 1 XNO = 10**30 raw) to pay_to, "
+                "then retry with the block hash in X-PAYMENT."
+                if payable else
+                "This 402 offers no XNO payment these tools can settle: send nothing. "
+                "See asset/network for the rail the seller asked for."
+            ),
         })
 
 

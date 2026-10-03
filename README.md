@@ -39,13 +39,18 @@ from langchain_vend import VendWebSearch, VendExtract, VendGeoIP
 
 tool = VendWebSearch()
 result = tool.invoke({"q": "nano cryptocurrency"})
-# {"requires_payment": true, "price_xno": "0.0001",
-#  "amount_raw": "100000000000000000000000000",
-#  "network": "nano:mainnet", "pay_to": "nano_1yo6..."}
+# {"requires_payment": true, "payable_in_xno": true, "price_xno": "0.0001",
+#  "amount_raw": "100000000000000000000000000", "asset": "XNO",
+#  "network": "nano:mainnet", "scheme": "exact", "pay_to": "nano_1yo6..."}
 ```
 
+`payable_in_xno` is false when the 402 asks for some other rail. The quote then
+carries no `amount_raw` and no price, and an agent must send nothing: `asset`
+and `network` say what the seller actually wanted.
+
 Live (pays on the call): pass a wallet. `nano_pay.wallet.Wallet` takes a file
-path, not a seed — the seed lives in that file.
+path, not a seed — the seed lives in that file. Hold a wallet and still only
+read the price with `dry_run=True`.
 
 ```python
 from nano_pay.wallet import Wallet
