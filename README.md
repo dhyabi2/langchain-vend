@@ -50,16 +50,24 @@ and `network` say what the seller actually wanted.
 
 Live (pays on the call). A wallet alone is not enough: `dry_run` defaults to
 `True`, so `VendExtract(wallet=w)` still returns the quote and spends nothing.
-Paying is opt-in, and `dry_run=False` is how you opt in.
+Paying is opt-in, and `dry_run=False` is how you opt in. `nano_pay.wallet.Wallet`
+takes a file path, not a seed — the seed lives in that file.
 
 ```python
 from nano_pay.wallet import Wallet
 from langchain_vend import VendExtract
 
-w = Wallet(seed="...")
+w = Wallet()                              # ~/.nano-pay/wallet.json
+w.load() if w.exists() else w.create()    # create() takes an optional seed
 tool = VendExtract(wallet=w, dry_run=False)   # dry_run=False is what spends
 print(tool.invoke({"url": "https://example.com"}))
+# {"result": {...the answer...},
+#  "payment": {"amount_xno": "0.0001", "block": "...", "settled": true}}
 ```
+
+The spend cap is the quoted amount itself: a seller that asks for more on the
+paying call is refused, not paid. Hold a wallet and still only read the price
+with `VendExtract(wallet=w, dry_run=True)`.
 
 ## How payment works (x402)
 

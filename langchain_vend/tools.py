@@ -21,10 +21,11 @@ Usage (dry-run: read prices / prove the endpoint answers, spend nothing):
 
 Usage (live): pass a wallet that can sign Nano blocks AND opt in with
 dry_run=False. A wallet on its own leaves the tool in dry-run, quoting and
-spending nothing.
+spending nothing: paying is opt-in and this branch does not change that.
     from nano_pay.wallet import Wallet
-    w = Wallet(seed="...")
-    tool = VendWebSearch(wallet=w, dry_run=False)
+    w = Wallet()                         # ~/.nano-pay/wallet.json
+    w.load() if w.exists() else w.create()
+    tool = VendWebSearch(wallet=w)
     print(await tool.ainvoke({"q": "nano cryptocurrency"}))
 """
 
@@ -145,10 +146,18 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
 
 
 class _VendTool(BaseTool):
-    """Base: one Vend endpoint, x402 payment, dry-run safety."""
+    """Base: one Vend endpoint, x402 payment, dry-run safety.
+
+    Without a wallet the tool quotes and spends nothing. With a wallet it pays
+    the quoted XNO amount and returns the merchant's answer together with the
+    settlement receipt: ``{"result": ..., "payment": {...}}``. Pass
+    ``dry_run=True`` to hold a wallet and still only read the price.
+    """
 
     _endpoint: str = ""
     wallet: Optional[Any] = None
+    #: Nano RPC used to sign and settle; defaults to `nano_pay.rpc.RPC()`.
+    rpc: Optional[Any] = None
     dry_run: bool = True
 
     def _call_vend(self, **params) -> Dict[str, Any]:
@@ -159,12 +168,33 @@ class _VendTool(BaseTool):
             quote = _parse_quote(challenge)
             if not self.wallet or self.dry_run:
                 raise Vend402Quote(quote)
+            if not quote.get("amount_raw"):
+                raise RuntimeError(
+                    "the 402 carries no payable XNO offer; nothing was paid: "
+                    + json.dumps(quote)
+                )
             try:
-                from nano_pay.wallet import Wallet as _W  # noqa: F401
+                from nano_pay.rpc import RPC
                 from nano_pay.x402 import request_with_payment
             except ImportError as e:  # pragma: no cover - live only
                 raise RuntimeError("live x402 needs `pip install feeless402`") from e
-            return request_with_payment(url, params=params, wallet=self.wallet, timeout=60)
+            # `request_with_payment(method, url, wallet, rpc, max_raw, **req_kwargs)`
+            # returns `(response, receipt)`. The cap is exactly the raw amount
+            # the agent was quoted: a seller that raises the price on the
+            # paying call is refused, not paid. `timeout` is the library's.
+            paid, receipt = request_with_payment(
+                "GET",
+                url,
+                self.wallet,
+                self.rpc or RPC(),
+                int(quote["amount_raw"]),
+                params=params,
+            )
+            if paid.status_code != 200:
+                raise RuntimeError(
+                    f"Vend {url} -> HTTP {paid.status_code} after payment: {paid.text[:200]}"
+                )
+            return {"result": paid.json(), "payment": receipt or {}}
         if resp.status_code != 200:
             raise RuntimeError(f"Vend {self._endpoint} -> HTTP {resp.status_code}: {resp.text[:200]}")
         return resp.json()
