@@ -1,0 +1,97 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: offline suite (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # pyproject.toml declares requires-python = ">=3.10", so every version it
+        # admits is run and the floor is not left as a claim.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: every module compiles on this interpreter
+        run: python -m compileall -q langchain_vend tests examples
+      - name: install
+        run: pip install -e ".[test]"
+      - name: offline suite
+        # The suite replaces httpx and nano_pay with stand-ins, so it reaches no
+        # network, no wallet and no seed. It is installed WITHOUT the `live` extra
+        # on purpose: the tools must quote without feeless402 present.
+        run: pytest -q
+
+  real_dependency:
+    name: the live payment call binds to the real feeless402
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install with the live extra
+        run: pip install -e ".[test,live]"
+      - name: the call in tools.py binds to the signature feeless402 declares
+        # The offline suite checks the payment path against a fake that moves with
+        # the caller, so it could not see the defect that actually shipped (#2):
+        # the arguments did not bind to the real entry point and the live path
+        # could not pay at all. This job is the only thing that can see that, and
+        # it is a hard check, not best-effort - `live` is a declared extra of this
+        # project, so a dependency whose entry point moved means the documented
+        # live usage is broken.
+        run: python .github/dependency_signature_check.py
+      - name: the offline suite still passes with the real dependency installed
+        # A stub installed over a real module can mask an import error; running the
+        # suite in this environment too proves the monkeypatching still applies.
+        run: pytest -q
+
+  installed:
+    name: installed wheel imports from outside the checkout
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: build the wheel in its own venv
+        # Built in a venv rather than with the interpreter's own pip: an
+        # `--upgrade pip` against a distro-managed interpreter is refused (PEP 668).
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/buildenv
+          /tmp/buildenv/bin/python -m pip install --quiet --upgrade pip build
+          /tmp/buildenv/bin/python -m build --wheel
+      - name: install it and import the tools from a temporary directory
+        # `[tool.setuptools] packages` names the package by hand, so a module that
+        # is not shipped still imports inside the checkout. Running from elsewhere
+        # is what makes the import come from the install.
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/wheelvenv
+          /tmp/wheelvenv/bin/pip install --quiet dist/*.whl
+          cd "$(mktemp -d)"
+          /tmp/wheelvenv/bin/python -c "
+          from langchain_vend import VendExtract, VendGeoIP, VendWebSearch
+          for cls in (VendExtract, VendGeoIP, VendWebSearch):
+              t = cls()
+              assert t.name and t.description, cls.__name__
+              assert t.dry_run is True, f'{cls.__name__} does not ship dry_run=True'
+          print('OK: all three tools import from the wheel and ship dry_run=True')
+          "
