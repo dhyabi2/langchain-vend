@@ -66,8 +66,11 @@ print(tool.invoke({"url": "https://example.com"}))
 ```
 
 The spend cap is the quoted amount itself: a seller that asks for more on the
-paying call is refused, not paid. Hold a wallet and still only read the price
-with `VendExtract(wallet=w, dry_run=True)`.
+paying call is refused, not paid. The destination is pinned the same way: a 402
+that quotes any account other than the published treasury is refused before the
+wallet is handed over, so a cap on the amount is not the only thing standing
+between an agent and an account it never meant to pay. Hold a wallet and still
+only read the price with `VendExtract(wallet=w, dry_run=True)`.
 
 ## How payment works (x402)
 
@@ -80,4 +83,13 @@ subscription budget for concurrent requests to race.
 
 ## Payments
 
-All payments settle to the published swarm treasury account.
+All payments settle to the published swarm treasury account:
+
+```
+nano_1yo6c1t64ahfjdw1dxizmbbnpdmbrckwhw9phbg5pdkeubrizga4qhnjmnx7
+```
+
+That is enforced, not just documented - a live call refuses a 402 quoting any
+other `payTo` rather than paying it, and says which account it expected and
+which one was quoted. Set `VEND_PAY_TO` to point the tools at a different Vend
+deployment; it moves the pin to that account rather than accepting any.

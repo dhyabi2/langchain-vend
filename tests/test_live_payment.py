@@ -23,6 +23,7 @@ import pytest
 
 sys.path.insert(0, __file__.rsplit("/", 2)[0])
 
+from langchain_vend import tools
 from langchain_vend.tools import RAW_PER_XNO, VendWebSearch
 
 PRICE_RAW = "100000000000000000000000000"  # 0.0001 XNO
@@ -131,3 +132,90 @@ def test_a_402_with_no_payable_xno_offer_is_refused_not_paid(paid_calls, monkeyp
     with pytest.raises(RuntimeError, match="no payable XNO offer"):
         VendWebSearch(wallet=_Wallet(), dry_run=False).invoke({"q": "nano"})
     assert paid_calls == [], "paid against a 402 that quoted no XNO amount"
+
+
+# --- the destination the money lands in ---------------------------------------
+#
+# `max_raw` caps the AMOUNT. Nothing capped the DESTINATION:
+# `nano_pay.x402.request_with_payment` is declared
+# `(method, url, wallet, rpc, max_raw, headers=None, dry_run=False, prework=False,
+# **req_kwargs)` - no destination parameter - so the account a live payment lands
+# in was whatever the 402 named, while `VEND_TREASURY_DEFAULT` sat exported and
+# unread and README.md said "All payments settle to the published swarm treasury
+# account". These tests hold the pin that makes that sentence true.
+
+OTHER_ACCOUNT = "nano_3t6k35gi95xu6tergt6p69ck76ogmitsa8mnijtpxm9fkcm736xtoncuohr3"
+
+FOREIGN_402 = json.loads(json.dumps(VEND_402))
+FOREIGN_402["accepts"][0]["payTo"] = OTHER_ACCOUNT
+FOREIGN_402["pay_to"] = OTHER_ACCOUNT
+
+
+def test_a_402_quoting_a_destination_we_are_not_pinned_to_is_refused_not_paid(
+    paid_calls, monkeypatch
+):
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _Resp(402, FOREIGN_402))
+    with pytest.raises(RuntimeError, match="not pinned to"):
+        VendWebSearch(wallet=_Wallet(), dry_run=False).invoke({"q": "nano"})
+    assert paid_calls == [], (
+        "paid 0.0001 XNO to an account the 402 chose: the cap is on the amount, "
+        "not on where the money goes"
+    )
+
+
+def test_the_refusal_names_both_accounts_so_the_agent_can_tell_them_apart(
+    paid_calls, monkeypatch
+):
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _Resp(402, FOREIGN_402))
+    with pytest.raises(RuntimeError) as e:
+        VendWebSearch(wallet=_Wallet(), dry_run=False).invoke({"q": "nano"})
+    assert TREASURY in str(e.value) and OTHER_ACCOUNT in str(e.value)
+
+
+def test_a_402_with_a_payable_amount_but_no_destination_is_refused(
+    paid_calls, monkeypatch
+):
+    no_dest = json.loads(json.dumps(VEND_402))
+    no_dest["accepts"][0].pop("payTo")
+    no_dest.pop("pay_to")
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _Resp(402, no_dest))
+    with pytest.raises(RuntimeError, match="not pinned to"):
+        VendWebSearch(wallet=_Wallet(), dry_run=False).invoke({"q": "nano"})
+    assert paid_calls == [], "paid an amount with no destination quoted for it"
+
+
+# --- controls: the pin must not cost a good payment ---------------------------
+
+
+def test_the_real_vend_treasury_quote_is_still_paid(paid_calls):
+    """The recorded live 402 names exactly VEND_TREASURY_DEFAULT. If the pin
+    refused this, it would refuse every real call."""
+    out = json.loads(
+        VendWebSearch(wallet=_Wallet(), dry_run=False).invoke({"q": "nano"})
+    )
+    assert len(paid_calls) == 1 and out["result"] == ANSWER
+    assert VEND_402["accepts"][0]["payTo"] == tools.VEND_TREASURY_DEFAULT
+
+
+def test_vend_pay_to_moves_the_pin_rather_than_removing_it(paid_calls, monkeypatch):
+    """A different Vend deployment is reachable - by naming its account, not by
+    accepting any account."""
+    monkeypatch.setattr(tools, "VEND_TREASURY_DEFAULT", OTHER_ACCOUNT)
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _Resp(402, FOREIGN_402))
+    out = json.loads(
+        VendWebSearch(wallet=_Wallet(), dry_run=False).invoke({"q": "nano"})
+    )
+    assert len(paid_calls) == 1 and out["result"] == ANSWER
+    # and the original treasury is now the one refused, so the pin really moved
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _Resp(402, VEND_402))
+    with pytest.raises(RuntimeError, match="not pinned to"):
+        VendWebSearch(wallet=_Wallet(), dry_run=False).invoke({"q": "nano"})
+
+
+def test_the_pin_does_not_touch_dry_run_quoting(paid_calls, monkeypatch):
+    """A quote still reports a foreign destination instead of refusing: reading a
+    price spends nothing, and seeing the odd account is how an agent finds out."""
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _Resp(402, FOREIGN_402))
+    out = json.loads(VendWebSearch().invoke({"q": "nano"}))
+    assert out["requires_payment"] is True and out["pay_to"] == OTHER_ACCOUNT
+    assert paid_calls == []

@@ -39,6 +39,9 @@ from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
 
 # All Vend payments settle to the swarm treasury - single destination, no issuer.
+# This is the account a live payment is PINNED to: `_call_vend` refuses a 402 that
+# quotes any other `payTo` rather than paying it. Override it with `VEND_PAY_TO`
+# when pointing these tools at a different Vend deployment.
 VEND_TREASURY_DEFAULT = os.environ.get(
     "VEND_PAY_TO",
     "nano_1yo6c1t64ahfjdw1dxizmbbnpdmbrckwhw9phbg5pdkeubrizga4qhnjmnx7",
@@ -172,6 +175,22 @@ class _VendTool(BaseTool):
                 raise RuntimeError(
                     "the 402 carries no payable XNO offer; nothing was paid: "
                     + json.dumps(quote)
+                )
+            # The cap below is on the AMOUNT only. `request_with_payment` takes no
+            # destination argument, so without this check the account the money
+            # lands in is whatever the 402 names - while this package publishes a
+            # single treasury and the README promises every payment settles there.
+            # A quoted destination that is not that account is refused here, before
+            # the wallet is handed over. `VEND_PAY_TO` moves the pin for a different
+            # Vend deployment; it is not a default that can be wandered off.
+            if quote.get("pay_to") != VEND_TREASURY_DEFAULT:
+                raise RuntimeError(
+                    "the 402 quotes a destination this package is not pinned to; "
+                    "nothing was paid. expected "
+                    + json.dumps(VEND_TREASURY_DEFAULT)
+                    + ", quoted "
+                    + json.dumps(quote.get("pay_to"))
+                    + " (set VEND_PAY_TO to pay a different Vend deployment)"
                 )
             try:
                 from nano_pay.rpc import RPC
