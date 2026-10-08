@@ -83,6 +83,27 @@ def main():
         _fail(f"nano_pay.wallet.Wallet() no longer constructs with no arguments ({wsig}); "
               f"the README snippet `w = Wallet()` is broken: {e}")
 
+    # `_PayeePinnedWallet` in langchain_vend/tools.py pins the destination by
+    # intercepting ONE method, `build_payment_block`, and forwarding everything
+    # else through `__getattr__`. If the dependency ever signs through a
+    # different call, or takes the destination in a different position, the
+    # proxy would forward that call untouched and the pin would be silently
+    # gone - a refusal that stopped refusing, with a green suite, because the
+    # offline fake calls whatever the proxy declares. So the pin's two
+    # assumptions are checked against the real dependency here.
+    if "wallet.build_payment_block(" not in inspect.getsource(request_with_payment):
+        _fail("nano_pay.x402.request_with_payment no longer signs through "
+              "wallet.build_payment_block(). langchain_vend/tools.py pins the "
+              "payment's destination by intercepting exactly that method, so the "
+              "pin would forward the real signing call untouched and no longer "
+              "refuse a destination moved after the quote.")
+    bsig = inspect.signature(Wallet.build_payment_block)
+    bnames = [n for n in bsig.parameters if n != "self"]
+    if bnames[:3] != ["rpc", "to_addr", "raw_amt"]:
+        _fail(f"nano_pay.wallet.Wallet.build_payment_block is now {bsig}; "
+              "langchain_vend/tools.py's _PayeePinnedWallet reads the destination "
+              "from the second positional argument and would pin the wrong value.")
+
     if not hasattr(rpc_mod, "RPC"):
         _fail("nano_pay.rpc.RPC is gone; langchain_vend/tools.py constructs RPC() as the "
               "default Nano RPC for a payment and would raise AttributeError.")

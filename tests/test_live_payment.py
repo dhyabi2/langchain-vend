@@ -219,3 +219,164 @@ def test_the_pin_does_not_touch_dry_run_quoting(paid_calls, monkeypatch):
     out = json.loads(VendWebSearch().invoke({"q": "nano"}))
     assert out["requires_payment"] is True and out["pay_to"] == OTHER_ACCOUNT
     assert paid_calls == []
+
+
+# --- the destination at SIGNING time, not only at the quote -------------------
+#
+# The pin above is checked against the 402 that `_call_vend` reads itself.
+# `nano_pay.x402.request_with_payment` makes its OWN request and signs the payee
+# of THAT read:
+#
+#     r = requests.request(method, url, ...)          # a second read of the 402
+#     quote = parse_quote(r); offer = pick_nano_offer(quote)
+#     amount = offer_amount_raw(offer); pay_to = offer_pay_to(offer)
+#     if amount > max_raw: raise PriceCapExceeded(...)   # the amount is checked
+#     block, ... = wallet.build_payment_block(rpc, pay_to, amount)   # pay_to is not
+#
+# So an endpoint can quote the treasury on the read that is checked and name
+# another account on the read that is paid. Every fake above replaces
+# `request_with_payment` wholesale and never re-reads, so nothing in the suite
+# could see it. The fake below mirrors that body instead.
+
+SECOND_READ_402 = json.loads(json.dumps(VEND_402))
+SECOND_READ_402["accepts"][0]["payTo"] = OTHER_ACCOUNT
+SECOND_READ_402["pay_to"] = OTHER_ACCOUNT
+
+
+class _SigningWallet:
+    """A wallet that records every block it is asked to sign."""
+
+    path = "/nonexistent/wallet.json"
+
+    def __init__(self):
+        self.signed = []
+
+    def build_payment_block(self, rpc, to_addr, raw_amt):
+        self.signed.append((str(to_addr), int(raw_amt)))
+        return {"type": "state", "link_as_account": str(to_addr)}, "B10C" * 16, "work-root"
+
+    def account(self):
+        raise AssertionError("the replay proof is not part of this test")
+
+    def payment_succeeded(self, *a, **k):
+        pass
+
+    def payment_failed(self, *a, **k):
+        pass
+
+
+@pytest.fixture
+def rereading_payer(monkeypatch):
+    """`request_with_payment` as feeless402 really declares it: it re-reads the
+    402 and signs the payee of that second read.
+
+    `reads` is the queue of 402 bodies: the first is what `_call_vend` checks,
+    the second is what the payment actually signs against.
+    """
+    reads = []
+
+    def httpx_get(*a, **k):
+        return _Resp(402, reads.pop(0) if len(reads) > 1 else reads[0])
+
+    def request_with_payment(method, url, wallet, rpc, max_raw, headers=None,
+                             dry_run=False, prework=False, **req_kwargs):
+        body = httpx_get()                      # the payer's own read of the 402
+        offer = body.json()["accepts"][0]
+        amount = int(offer["amount"])
+        pay_to = offer.get("payTo")
+        if amount > max_raw:
+            raise RuntimeError("PriceCapExceeded")
+        wallet.build_payment_block(rpc, pay_to, amount)
+        return _Resp(200, ANSWER), dict(RECEIPT)
+
+    class RPC:
+        pass
+
+    x402 = types.ModuleType("nano_pay.x402")
+    x402.request_with_payment = request_with_payment
+    rpc_mod = types.ModuleType("nano_pay.rpc")
+    rpc_mod.RPC = RPC
+    monkeypatch.setitem(sys.modules, "nano_pay", types.ModuleType("nano_pay"))
+    monkeypatch.setitem(sys.modules, "nano_pay.x402", x402)
+    monkeypatch.setitem(sys.modules, "nano_pay.rpc", rpc_mod)
+    monkeypatch.setattr(httpx, "get", httpx_get)
+    return reads
+
+
+def test_a_destination_moved_after_the_check_is_refused_at_signing(rereading_payer):
+    """Quote the treasury, sign to somebody else: nothing may be signed.
+
+    Without the pin at signing time this passes 0.0001 XNO to OTHER_ACCOUNT and
+    returns a served 200, because the amount is right, the cap is satisfied and
+    the account is the only thing nobody compared.
+    """
+    rereading_payer[:] = [VEND_402, SECOND_READ_402]
+    wallet = _SigningWallet()
+    with pytest.raises(RuntimeError, match="moved the destination"):
+        VendWebSearch(wallet=wallet, dry_run=False).invoke({"q": "nano"})
+    assert wallet.signed == [], (
+        "signed a block to %r: the destination was checked against the first read "
+        "of the 402 and never against the account the block pays" % (wallet.signed,)
+    )
+
+
+def test_the_refusal_names_the_pinned_and_the_asked_account(rereading_payer):
+    rereading_payer[:] = [VEND_402, SECOND_READ_402]
+    with pytest.raises(RuntimeError) as e:
+        VendWebSearch(wallet=_SigningWallet(), dry_run=False).invoke({"q": "nano"})
+    assert TREASURY in str(e.value) and OTHER_ACCOUNT in str(e.value)
+    assert "nothing was paid" in str(e.value)
+
+
+def test_an_unchanged_destination_is_still_signed_and_paid(rereading_payer):
+    """The control: the pin must not cost the ordinary payment. Both reads name
+    the treasury, which is what a real Vend endpoint does."""
+    rereading_payer[:] = [VEND_402, VEND_402]
+    wallet = _SigningWallet()
+    out = json.loads(VendWebSearch(wallet=wallet, dry_run=False).invoke({"q": "nano"}))
+    assert out["result"] == ANSWER
+    assert wallet.signed == [(TREASURY, int(PRICE_RAW))]
+
+
+def test_a_payee_restated_identically_on_the_paying_read_is_still_paid(rereading_payer):
+    """A second read that is a different dict object with the same account is the
+    same payee: the pin compares addresses, not identity."""
+    restated = json.loads(json.dumps(VEND_402))
+    rereading_payer[:] = [VEND_402, restated]
+    wallet = _SigningWallet()
+    out = json.loads(VendWebSearch(wallet=wallet, dry_run=False).invoke({"q": "nano"}))
+    assert out["result"] == ANSWER and wallet.signed == [(TREASURY, int(PRICE_RAW))]
+
+
+def test_vend_pay_to_still_moves_the_pin_at_signing_time(rereading_payer, monkeypatch):
+    """A different Vend deployment stays reachable: the pin follows the operator's
+    account, it is not a hardcoded single address."""
+    monkeypatch.setattr(tools, "VEND_TREASURY_DEFAULT", OTHER_ACCOUNT)
+    rereading_payer[:] = [SECOND_READ_402, SECOND_READ_402]
+    wallet = _SigningWallet()
+    out = json.loads(VendWebSearch(wallet=wallet, dry_run=False).invoke({"q": "nano"}))
+    assert out["result"] == ANSWER and wallet.signed == [(OTHER_ACCOUNT, int(PRICE_RAW))]
+
+
+def test_the_pinned_wallet_forwards_everything_else_to_the_real_wallet():
+    """`request_with_payment` reads `wallet.path` for its journal and calls
+    `payment_succeeded`/`payment_failed`. A proxy that hid those would break the
+    payment it is meant to protect."""
+    inner = _SigningWallet()
+    proxied = tools._PayeePinnedWallet(inner, TREASURY)
+    assert proxied.path == inner.path
+    proxied.payment_failed("work-root")        # must not raise
+    assert proxied.build_payment_block(None, TREASURY, 1)[1] == "B10C" * 16
+    assert inner.signed == [(TREASURY, 1)]
+
+
+def test_nothing_is_signed_when_the_amount_is_raised_on_the_paying_read(rereading_payer):
+    """The amount half of the same hole, already closed by `max_raw`: pinned here
+    so a later change cannot pass the operator's cap instead of the quote."""
+    dearer = json.loads(json.dumps(VEND_402))
+    dearer["accepts"][0]["amount"] = str(int(PRICE_RAW) + 1)
+    rereading_payer[:] = [VEND_402, dearer]
+    wallet = _SigningWallet()
+    with pytest.raises(RuntimeError, match="PriceCapExceeded"):
+        VendWebSearch(wallet=wallet, dry_run=False).invoke({"q": "nano"})
+    assert wallet.signed == []
