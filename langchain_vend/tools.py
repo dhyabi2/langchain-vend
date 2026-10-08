@@ -148,6 +148,51 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+class _PayeeMoved(RuntimeError):
+    """The paying read asked for a block to an account that was never pinned."""
+
+    def __init__(self, pinned: str, asked: str):
+        self.pinned, self.asked = pinned, asked
+        super().__init__(
+            "the 402 moved the destination after it was checked; nothing was paid. "
+            "pinned " + json.dumps(pinned) + ", asked to sign to " + json.dumps(asked)
+            + " (set VEND_PAY_TO to pay a different Vend deployment)"
+        )
+
+
+class _PayeePinnedWallet:
+    """The wallet as `request_with_payment` sees it: it may only sign to the
+    account this package is pinned to.
+
+    `_call_vend` reads the 402 itself and refuses a `payTo` that is not
+    `VEND_TREASURY_DEFAULT`. But `nano_pay.x402.request_with_payment` makes its
+    OWN request and signs `offer_pay_to()` of THAT read, comparing only the
+    amount against `max_raw` (`nano_pay/x402.py`: `if amount > max_raw: raise
+    PriceCapExceeded`, then `wallet.build_payment_block(rpc, pay_to, amount)`).
+    Nothing compared the payee. So the check in `_call_vend` holds against our
+    read and never against the account finally signed: an endpoint can quote the
+    treasury on the read that is checked and name another account on the read
+    that is paid, and the block is signed to that other account.
+
+    `build_payment_block` is the only place the wallet signs, so refusing here
+    means no block exists. Everything else is the real wallet, including `path`
+    and `account()`, which `request_with_payment` reads for its journal and its
+    replay proof.
+    """
+
+    def __init__(self, wallet: Any, pay_to: str):
+        self._wallet = wallet
+        self._pay_to = str(pay_to)
+
+    def __getattr__(self, name):
+        return getattr(self._wallet, name)
+
+    def build_payment_block(self, rpc, to_addr, raw_amt):
+        if str(to_addr) != self._pay_to:
+            raise _PayeeMoved(self._pay_to, str(to_addr))
+        return self._wallet.build_payment_block(rpc, to_addr, raw_amt)
+
+
 class _VendTool(BaseTool):
     """Base: one Vend endpoint, x402 payment, dry-run safety.
 
@@ -201,10 +246,17 @@ class _VendTool(BaseTool):
             # returns `(response, receipt)`. The cap is exactly the raw amount
             # the agent was quoted: a seller that raises the price on the
             # paying call is refused, not paid. `timeout` is the library's.
+            # The destination is pinned again HERE, at the only moment that is
+            # the real one: the block being built. The check above holds against
+            # the read made by this function; `request_with_payment` re-reads the
+            # 402 and signs whatever that read names. This only narrows what is
+            # signed - the single account allowed is the one already checked
+            # against `VEND_TREASURY_DEFAULT` - and it refuses before any block
+            # exists, so a moved destination is a payment that does not happen.
             paid, receipt = request_with_payment(
                 "GET",
                 url,
-                self.wallet,
+                _PayeePinnedWallet(self.wallet, quote["pay_to"]),
                 self.rpc or RPC(),
                 int(quote["amount_raw"]),
                 params=params,
