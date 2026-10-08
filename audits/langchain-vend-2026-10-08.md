@@ -79,6 +79,17 @@ This **only adds a refusal**: no amount, rounding, key path or destination
 changes, and the single account allowed is the one `_call_vend` had already
 checked against `VEND_TREASURY_DEFAULT`. `VEND_PAY_TO` still moves the pin.
 
+**The pin's own assumptions are now a CI law.** The proxy intercepts exactly one
+method and forwards the rest through `__getattr__`, so a dependency that signed
+through a different call, or took the destination in a different position, would
+have the real signing call forwarded untouched — a refusal that stopped refusing,
+with a green suite, because the offline fake calls whatever the proxy declares.
+`.github/dependency_signature_check.py` now asserts both against the real
+feeless402: that `request_with_payment` signs through `wallet.build_payment_block(`
+and that `Wallet.build_payment_block`'s first three parameters are
+`(rpc, to_addr, raw_amt)`. Both were mutation-checked: a renamed signing call and
+a swapped argument order each make the check exit 1 with the reason named.
+
 Failing-then-passing, `langchain_vend/tools.py` alone reverted to `main` with the
 tests kept: **3 failed, 28 passed**. Five of the eight additions are controls
 that hold either way — an unchanged destination is still paid, a payee restated
