@@ -31,6 +31,7 @@ spending nothing: paying is opt-in and this branch does not change that.
 
 import json
 import os
+import re
 from decimal import Decimal
 from typing import Any, Dict, Optional
 
@@ -57,6 +58,19 @@ VEND_ENDPOINTS = {
 #: 1 XNO = 10**30 raw. x402 quotes `accepts[].amount` in raw, as an integer
 #: string; raw is the only exact representation, so it is what we carry.
 RAW_PER_XNO = 10 ** 30
+
+#: An amount in raw is ASCII decimal digits. `str.isdigit()` is NOT that test, and it is
+#: what this read used: it is also true for 128 characters `int()` then REFUSES ('2' as
+#: U+00B2, '4' as U+2074, the Ethiopic digits), and true for the non-ASCII decimal digits
+#: `int()` happily converts (U+0663 -> 3), so an amount written in no ASCII at all could
+#: price a payment. `[0-9]` and not `\d`, because `re` matches Unicode digits by default.
+RAW_AMOUNT = re.compile(r"^[0-9]+$")
+
+#: A number in SOME notation, which is what the `price_xno` fallback below exists to
+#: rescue: a seller that wrote the raw amount as `1e26` or `0.0001` still named a price.
+#: Text that is not a number in any notation named nothing, and is refused instead.
+#: ASCII only, for the same reason as above.
+NUMERIC_TEXT = re.compile(r"^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$")
 
 
 def raw_to_xno(raw: int) -> str:
@@ -115,16 +129,34 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
 
     amount_raw = None
     price_xno = None
+    unreadable = False
     if offer is not None:
         amount = offer.get("amount")
-        if isinstance(amount, str) and amount.strip().isdigit() and int(amount) > 0:
-            amount_raw = str(int(amount))
-            price_xno = raw_to_xno(int(amount_raw))
+        if isinstance(amount, bool):
+            # `bool` IS an `int` in Python, so `"amount": true` reached the integer
+            # branch below, `str(True)` put the text "True" in `amount_raw`, and the
+            # quote went out `payable` - after which `int(quote["amount_raw"])` on the
+            # paying call raised ValueError. `true` is not an amount: nothing is priced.
+            unreadable = True
+        elif isinstance(amount, str):
+            text = amount.strip()
+            if RAW_AMOUNT.match(text):
+                if int(text) > 0:
+                    amount_raw = str(int(text))
+                    price_xno = raw_to_xno(int(amount_raw))
+            elif not NUMERIC_TEXT.match(text):
+                # Not a number in any notation. This used to be `isdigit()`, which let
+                # 128 such characters through to `int()` and raised ValueError out of
+                # this function - on the dry-run read too, so an agent could not even
+                # ask the price. An offer whose amount says nothing is priced by
+                # nothing: the `price_xno` fallback below is not asked to invent one.
+                unreadable = True
         elif isinstance(amount, int) and amount > 0:
             amount_raw = str(amount)
             price_xno = raw_to_xno(amount)
 
-    if offer is not None and price_xno is None and challenge.get("price_xno") is not None:
+    if (offer is not None and price_xno is None and not unreadable
+            and challenge.get("price_xno") is not None):
         # Vend's own field, in XNO. Read through str() so 0.0001 stays 0.0001.
         # Only reachable with a payable Nano offer in hand, so the amount it
         # yields belongs to the destination reported below.
