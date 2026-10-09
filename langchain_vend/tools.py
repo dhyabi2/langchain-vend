@@ -32,7 +32,7 @@ spending nothing: paying is opt-in and this branch does not change that.
 import json
 import os
 import re
-from decimal import Decimal
+from decimal import Decimal, Inexact, localcontext
 from typing import Any, Dict, Optional
 
 import httpx
@@ -160,14 +160,34 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
         # Vend's own field, in XNO. Read through str() so 0.0001 stays 0.0001.
         # Only reachable with a payable Nano offer in hand, so the amount it
         # yields belongs to the destination reported below.
+        #
+        # The conversion runs in its own Decimal context with `Inexact` trapped.
+        # `decimal.getcontext().prec` is 28 significant digits by default and
+        # this module never sets it, while an XNO amount carries up to 30
+        # decimal places (10**30 raw to the XNO) and raw reaches 39 digits. So
+        # `Decimal("1.000000000000000000000000000001") * RAW_PER_XNO` silently
+        # returned 10**30 - one raw SHORT of the price - and the
+        # `to_integral_value()` test could not see it, because a value rounded
+        # at the 28th digit is still an integer. Rounding the other way is worse:
+        # a price of 12.3456789012345678901234567890123 XNO yielded a cap 988 raw
+        # ABOVE what was quoted.
+        #
+        # A price this function cannot convert exactly is now refused: the quote
+        # stays unpriced, so `_call_vend` raises "no payable XNO offer" before a
+        # wallet is handed over. An amount nobody quoted is never carried into
+        # the spend cap.
         try:
-            xno = Decimal(str(challenge["price_xno"]))
-            raw = xno * RAW_PER_XNO
-            if xno >= 0 and raw == raw.to_integral_value():
-                amount_raw = str(int(raw))
+            with localcontext() as ctx:
+                ctx.prec = 60  # 39 digits of raw with headroom; no legal amount rounds
+                ctx.traps[Inexact] = True
+                xno = Decimal(str(challenge["price_xno"]))
+                raw = xno * RAW_PER_XNO
+                if xno >= 0 and raw == raw.to_integral_value():
+                    amount_raw = str(int(raw))
+            if amount_raw is not None:
                 price_xno = raw_to_xno(int(amount_raw))
-        except Exception:  # decimal.InvalidOperation and friends
-            pass
+        except Exception:  # decimal.Inexact, decimal.InvalidOperation and friends
+            amount_raw = None
 
     return {
         "price_xno": price_xno,
