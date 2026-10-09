@@ -31,6 +31,7 @@ spending nothing: paying is opt-in and this branch does not change that.
 
 import json
 import os
+import re
 from decimal import Decimal, Inexact, localcontext
 from typing import Any, Dict, Optional
 
@@ -57,6 +58,19 @@ VEND_ENDPOINTS = {
 #: 1 XNO = 10**30 raw. x402 quotes `accepts[].amount` in raw, as an integer
 #: string; raw is the only exact representation, so it is what we carry.
 RAW_PER_XNO = 10 ** 30
+
+#: An amount in raw is ASCII decimal digits. `str.isdigit()` is NOT that test, and it is
+#: what this read used: it is also true for 128 characters `int()` then REFUSES ('2' as
+#: U+00B2, '4' as U+2074, the Ethiopic digits), and true for the non-ASCII decimal digits
+#: `int()` happily converts (U+0663 -> 3), so an amount written in no ASCII at all could
+#: price a payment. `[0-9]` and not `\d`, because `re` matches Unicode digits by default.
+RAW_AMOUNT = re.compile(r"^[0-9]+$")
+
+#: A number in SOME notation, which is what the `price_xno` fallback below exists to
+#: rescue: a seller that wrote the raw amount as `1e26` or `0.0001` still named a price.
+#: Text that is not a number in any notation named nothing, and is refused instead.
+#: ASCII only, for the same reason as above.
+NUMERIC_TEXT = re.compile(r"^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$")
 
 
 def raw_to_xno(raw: int) -> str:
@@ -115,16 +129,34 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
 
     amount_raw = None
     price_xno = None
+    unreadable = False
     if offer is not None:
         amount = offer.get("amount")
-        if isinstance(amount, str) and amount.strip().isdigit() and int(amount) > 0:
-            amount_raw = str(int(amount))
-            price_xno = raw_to_xno(int(amount_raw))
+        if isinstance(amount, bool):
+            # `bool` IS an `int` in Python, so `"amount": true` reached the integer
+            # branch below, `str(True)` put the text "True" in `amount_raw`, and the
+            # quote went out `payable` - after which `int(quote["amount_raw"])` on the
+            # paying call raised ValueError. `true` is not an amount: nothing is priced.
+            unreadable = True
+        elif isinstance(amount, str):
+            text = amount.strip()
+            if RAW_AMOUNT.match(text):
+                if int(text) > 0:
+                    amount_raw = str(int(text))
+                    price_xno = raw_to_xno(int(amount_raw))
+            elif not NUMERIC_TEXT.match(text):
+                # Not a number in any notation. This used to be `isdigit()`, which let
+                # 128 such characters through to `int()` and raised ValueError out of
+                # this function - on the dry-run read too, so an agent could not even
+                # ask the price. An offer whose amount says nothing is priced by
+                # nothing: the `price_xno` fallback below is not asked to invent one.
+                unreadable = True
         elif isinstance(amount, int) and amount > 0:
             amount_raw = str(amount)
             price_xno = raw_to_xno(amount)
 
-    if offer is not None and price_xno is None and challenge.get("price_xno") is not None:
+    if (offer is not None and price_xno is None and not unreadable
+            and challenge.get("price_xno") is not None):
         # Vend's own field, in XNO. Read through str() so 0.0001 stays 0.0001.
         # Only reachable with a payable Nano offer in hand, so the amount it
         # yields belongs to the destination reported below.
@@ -166,6 +198,51 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
         "scheme": a0.get("scheme"),
         "payable": offer is not None and amount_raw is not None,
     }
+
+
+class _PayeeMoved(RuntimeError):
+    """The paying read asked for a block to an account that was never pinned."""
+
+    def __init__(self, pinned: str, asked: str):
+        self.pinned, self.asked = pinned, asked
+        super().__init__(
+            "the 402 moved the destination after it was checked; nothing was paid. "
+            "pinned " + json.dumps(pinned) + ", asked to sign to " + json.dumps(asked)
+            + " (set VEND_PAY_TO to pay a different Vend deployment)"
+        )
+
+
+class _PayeePinnedWallet:
+    """The wallet as `request_with_payment` sees it: it may only sign to the
+    account this package is pinned to.
+
+    `_call_vend` reads the 402 itself and refuses a `payTo` that is not
+    `VEND_TREASURY_DEFAULT`. But `nano_pay.x402.request_with_payment` makes its
+    OWN request and signs `offer_pay_to()` of THAT read, comparing only the
+    amount against `max_raw` (`nano_pay/x402.py`: `if amount > max_raw: raise
+    PriceCapExceeded`, then `wallet.build_payment_block(rpc, pay_to, amount)`).
+    Nothing compared the payee. So the check in `_call_vend` holds against our
+    read and never against the account finally signed: an endpoint can quote the
+    treasury on the read that is checked and name another account on the read
+    that is paid, and the block is signed to that other account.
+
+    `build_payment_block` is the only place the wallet signs, so refusing here
+    means no block exists. Everything else is the real wallet, including `path`
+    and `account()`, which `request_with_payment` reads for its journal and its
+    replay proof.
+    """
+
+    def __init__(self, wallet: Any, pay_to: str):
+        self._wallet = wallet
+        self._pay_to = str(pay_to)
+
+    def __getattr__(self, name):
+        return getattr(self._wallet, name)
+
+    def build_payment_block(self, rpc, to_addr, raw_amt):
+        if str(to_addr) != self._pay_to:
+            raise _PayeeMoved(self._pay_to, str(to_addr))
+        return self._wallet.build_payment_block(rpc, to_addr, raw_amt)
 
 
 class _VendTool(BaseTool):
@@ -221,10 +298,17 @@ class _VendTool(BaseTool):
             # returns `(response, receipt)`. The cap is exactly the raw amount
             # the agent was quoted: a seller that raises the price on the
             # paying call is refused, not paid. `timeout` is the library's.
+            # The destination is pinned again HERE, at the only moment that is
+            # the real one: the block being built. The check above holds against
+            # the read made by this function; `request_with_payment` re-reads the
+            # 402 and signs whatever that read names. This only narrows what is
+            # signed - the single account allowed is the one already checked
+            # against `VEND_TREASURY_DEFAULT` - and it refuses before any block
+            # exists, so a moved destination is a payment that does not happen.
             paid, receipt = request_with_payment(
                 "GET",
                 url,
-                self.wallet,
+                _PayeePinnedWallet(self.wallet, quote["pay_to"]),
                 self.rpc or RPC(),
                 int(quote["amount_raw"]),
                 params=params,

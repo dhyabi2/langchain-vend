@@ -11,9 +11,9 @@ import decimal
 import json
 import os
 import sys
+from decimal import Decimal
 
 import pytest
-from decimal import Decimal
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -284,6 +284,103 @@ def test_the_refusal_reaches_the_spend_path_not_just_the_quote():
         tools.httpx.get = original
 
 
+# --- an amount that is not an amount is refused, not crashed on ---------------
+#
+# `_parse_quote` read `accepts[].amount` with `amount.strip().isdigit()` and then
+# `int(amount)`. Those two are not the same test. `str.isdigit()` is true for 128
+# characters `int()` refuses -- '²', '⁴', the Ethiopic digits -- so the read raised
+# ValueError out of this function, on the dry-run path as well, where the whole
+# point is to learn the price while spending nothing. And `bool` is an `int` in
+# Python, so `"amount": true` reached the integer branch, `str(True)` wrote the
+# text "True" into `amount_raw`, and the quote went out `payable` with it; the
+# paying call then raised ValueError on `int(quote["amount_raw"])`.
+#
+# Both are now refusals: the offer is unpriced, `payable` is False, and an agent
+# is told to send nothing. Nothing that was payable before becomes unpayable's
+# opposite -- these only ever narrow what can be paid.
+
+def _nano_offer(amount):
+    """A payable nano:mainnet offer carrying `amount`, beside a `price_xno` the
+    fallback would otherwise use."""
+    return {
+        "price_xno": 0.0001,
+        "accepts": [
+            {"scheme": "exact", "network": "nano:mainnet", "asset": "XNO",
+             "amount": amount, "payTo": TREASURY}
+        ],
+    }
+
+
+# U+00B2, U+2074 and U+0661 are `isdigit()`; `int()` refuses the first two and
+# converts the third, so the old read either crashed or priced a payment off a
+# digit that is not ASCII.
+@pytest.mark.parametrize("amount", ["²", "⁴", "፩", "٣", "١٢"])
+def test_an_amount_that_is_not_ascii_digits_is_refused_not_crashed_on(amount):
+    q = _parse_quote(_nano_offer(amount))          # must not raise
+    assert q["amount_raw"] is None, f"priced a payment off {amount!r}"
+    assert q["price_xno"] is None
+    assert q["payable"] is False
+    # The seller's offer is still reported, so the caller can see what was asked.
+    assert (q["network"], q["asset"], q["pay_to"]) == ("nano:mainnet", "XNO", TREASURY)
+
+
+def test_every_isdigit_character_int_refuses_is_refused_rather_than_raising():
+    """The whole class, not one example of it: `isdigit()` and `int()` disagree on
+    128 characters, and each one of them used to raise out of this function."""
+    disagree = [chr(c) for c in range(0x110000)
+                if chr(c).isdigit() and not chr(c).isdecimal()]
+    assert len(disagree) == 128, "the Unicode tables moved; re-read this test"
+    for char in disagree:
+        q = _parse_quote(_nano_offer(char))        # must not raise
+        assert q["payable"] is False, repr(char)
+
+
+@pytest.mark.parametrize("amount", [True, False])
+def test_a_boolean_amount_is_refused_and_never_becomes_the_text_True(amount):
+    q = _parse_quote(_nano_offer(amount))
+    assert q["amount_raw"] is None, f"{amount!r} was quoted as {q['amount_raw']!r}"
+    assert q["payable"] is False
+
+
+def test_a_quoted_amount_is_always_an_integer_the_paying_call_can_read():
+    """The consequence the crash had: `_call_vend` does `int(quote["amount_raw"])`
+    to cap the payment, so an `amount_raw` that is not an integer string takes the
+    agent down after the destination pin has already passed."""
+    for amount in [True, False, "²", "٣", "not-a-number", "", "  "]:
+        q = _parse_quote(_nano_offer(amount))
+        if q["amount_raw"] is not None:
+            int(q["amount_raw"])                   # must not raise
+
+
+def test_an_unreadable_amount_tells_the_agent_to_send_nothing():
+    from langchain_vend.tools import _VendTool
+
+    rendered = json.loads(_VendTool._quote_json(_parse_quote(_nano_offer("²"))))
+    assert rendered["payable_in_xno"] is False
+    assert rendered["amount_raw"] is None
+    assert "send nothing" in rendered["note"].lower()
+
+
+def test_an_unreadable_amount_stops_the_payment_before_a_wallet_is_handed_over():
+    class _W:
+        pass
+
+    class _R:
+        status_code = 402
+        text = ""
+
+        def json(self):
+            return _nano_offer(True)
+
+    original = tools.httpx.get
+    tools.httpx.get = lambda *a, **k: _R()
+    try:
+        with pytest.raises(RuntimeError, match="no payable XNO offer"):
+            tools.VendWebSearch(wallet=_W(), dry_run=False).invoke({"q": "nano"})
+    finally:
+        tools.httpx.get = original
+
+
 def test_prices_that_already_converted_exactly_are_unchanged():
     """The change must not cost a single quote that was already right."""
     for price, expected_raw in [
@@ -323,3 +420,32 @@ def test_the_context_change_does_not_leak_out_of_the_quote():
     _parse_quote(_price_only_challenge("0.0001"))
     assert decimal.getcontext().prec == before_prec
     assert dict(decimal.getcontext().traps) == before_traps
+
+
+# Controls: the change must not cost a single quote that already worked.
+
+def test_an_ascii_integer_amount_is_unchanged():
+    for amount, expected in [("100000000000000000000000000", "100000000000000000000000000"),
+                             ("1", "1"), (100, "100"), ("007", "7")]:
+        q = _parse_quote(_nano_offer(amount))
+        assert q["amount_raw"] == expected, amount
+        assert q["payable"] is True
+
+
+def test_a_numeric_amount_in_another_notation_is_still_rescued_by_price_xno():
+    """`1e26` is a number, just not an integer raw string: the seller did name a
+    price, and this repository deliberately rescues it from `price_xno`
+    (test_price_xno_still_rescues_a_nano_offer_whose_raw_amount_is_unusable).
+    That path is untouched -- only text that names no number at all is refused."""
+    for amount in ["1e26", "0.0001", "-5", "0", "+1e26", ".5"]:
+        q = _parse_quote(_nano_offer(amount))
+        assert q["amount_raw"] == "100000000000000000000000000", amount
+        assert q["payable"] is True
+
+
+def test_a_missing_amount_is_still_rescued_by_price_xno():
+    challenge = _nano_offer(None)
+    del challenge["accepts"][0]["amount"]
+    q = _parse_quote(challenge)
+    assert q["amount_raw"] == "100000000000000000000000000"
+    assert q["payable"] is True
