@@ -268,7 +268,13 @@ class _VendTool(BaseTool):
             quote = _parse_quote(challenge)
             if not self.wallet or self.dry_run:
                 raise Vend402Quote(quote)
-            if not quote.get("amount_raw"):
+            # `"0"` is a non-empty string, so `not quote["amount_raw"]` was False for it
+            # and a quote of zero raw went on to be handed to `request_with_payment` as
+            # `max_raw=0`. Zero is not a payable amount: there is nothing to send, and a
+            # cap of zero either refuses with a cap nobody set ("exceeds cap 0 XNO") or,
+            # if the paying read also says zero, has the wallet sign a block that moves
+            # nothing. Refused here, with the same message as a 402 that priced nothing.
+            if not quote.get("amount_raw") or int(quote["amount_raw"]) <= 0:
                 raise RuntimeError(
                     "the 402 carries no payable XNO offer; nothing was paid: "
                     + json.dumps(quote)
