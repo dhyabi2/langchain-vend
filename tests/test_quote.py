@@ -11,6 +11,7 @@ import decimal
 import json
 import os
 import sys
+import types
 from decimal import Decimal
 
 import pytest
@@ -449,3 +450,75 @@ def test_a_missing_amount_is_still_rescued_by_price_xno():
     q = _parse_quote(challenge)
     assert q["amount_raw"] == "100000000000000000000000000"
     assert q["payable"] is True
+
+
+# -- a quote of zero raw is not a payable quote ------------------------------------------------
+#
+# `_call_vend`'s guard was `if not quote.get("amount_raw")`, and `"0"` is a non-empty string.
+
+
+def _zero_price_challenge():
+    """A payable Nano offer with no readable amount, and `price_xno: 0` alongside it.
+
+    The `price_xno` rescue then yields `amount_raw == "0"` and `payable` True, which is the
+    only way a quote of zero reaches the spend path.
+    """
+    challenge = json.loads(json.dumps(VEND_402))
+    del challenge["accepts"][0]["amount"]
+    challenge["price_xno"] = 0
+    return challenge
+
+
+def test_a_zero_quote_is_never_handed_to_the_paying_call():
+    """`max_raw=0` is a cap nobody set.
+
+    `request_with_payment` either refuses with "exceeds cap 0 XNO" - a message about a cap the
+    agent never chose - or, when the paying read also says zero, calls
+    `wallet.build_payment_block(rpc, pay_to, 0)` and signs a block that moves nothing: proof of
+    work spent and a journal entry written for a payment that paid nobody.
+    """
+    reached = {}
+
+    class _W:
+        pass
+
+    class _R:
+        status_code = 402
+        text = ""
+
+        def json(self):
+            return _zero_price_challenge()
+
+    def _request_with_payment(method, url, wallet, rpc, max_raw, **kwargs):
+        reached["max_raw"] = max_raw
+        raise AssertionError(f"the spend path was reached with max_raw={max_raw!r}")
+
+    x402 = types.ModuleType("nano_pay.x402")
+    x402.request_with_payment = _request_with_payment
+    rpc_mod = types.ModuleType("nano_pay.rpc")
+    rpc_mod.RPC = lambda *a, **k: None
+
+    original_get, original_mods = tools.httpx.get, {k: sys.modules.get(k) for k in
+                                                    ("nano_pay.x402", "nano_pay.rpc")}
+    tools.httpx.get = lambda *a, **k: _R()
+    sys.modules["nano_pay.x402"], sys.modules["nano_pay.rpc"] = x402, rpc_mod
+    try:
+        with pytest.raises(RuntimeError, match="no payable XNO offer"):
+            tools.VendWebSearch(wallet=_W(), dry_run=False).invoke({"q": "nano"})
+    finally:
+        tools.httpx.get = original_get
+        for name, module in original_mods.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    assert "max_raw" not in reached, "a zero cap was handed to the paying call"
+
+
+def test_the_zero_quote_still_reads_as_unpayable_to_the_agent():
+    # The dry-run read is unchanged: the quote still reports what the seller said.
+    quote = _parse_quote(_zero_price_challenge())
+    assert quote["amount_raw"] == "0"
+    rendered = json.loads(tools._VendTool._quote_json(quote))
+    assert rendered["price_xno"] == "0"
