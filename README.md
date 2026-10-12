@@ -46,8 +46,9 @@ result = tool.invoke({"q": "nano cryptocurrency"})
 
 `payable_in_xno` is false when the 402 asks for some other rail, or when its
 Nano offer names no amount these tools can send. An offer amount must be an
-integer number of raw (digit text or a JSON integer) above zero and below
-2**128 raw; `1e26`, `0.5`, a JSON float, or anything that is not a number leaves
+integer number of raw above zero and below 2**128 raw: a JSON integer, or
+integer raw text exactly as Python's `int()` reads it (surrounding whitespace,
+leading zeros and a single leading `+` allowed); `1e26`, `0.5`, a JSON float, or anything that is not a number leaves
 the quote unpriced. The quote then carries no `amount_raw` and no price, and
 an agent must send nothing: `asset` and `network` say what the seller asked for.
 

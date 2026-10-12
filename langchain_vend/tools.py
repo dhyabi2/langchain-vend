@@ -79,8 +79,9 @@ RAW_AMOUNT = re.compile(r"^\+?[0-9]+$")
 #: `"1" * 40000 + "x"` backtracked quadratically and took ~38 s to reject.
 NUMERIC_TEXT = re.compile(r"^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$")
 
-#: No number this module can price is anywhere near this long (a raw amount is at most
-#: 39 digits; an XNO price at most 39 digits and a point). Longer text is refused before
+#: No `price_xno` this module can price is anywhere near this long (an XNO price is at
+#: most 39 digits and a point). It applies to `price_xno` only: an offer amount is read
+#: by `int()`, as the paying library reads it. Longer text is refused before
 #: any pattern or `Decimal()` reads it.
 MAX_NUMERIC_TEXT = 100
 
@@ -175,8 +176,8 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
     `Decimal(str(...))` so the quote leaving this function is never a float.
 
     An `amount` that is present is the price, and it must be an integer number
-    of raw: ASCII digit text that `int()` itself reads to the same value (at
-    most 100 characters, leading zeros and the whitespace `int()` accepts
+    of raw: ASCII digit text that `int()` itself reads to the same value
+    (leading zeros, a single leading `+` and the whitespace `int()` accepts
     allowed) or a JSON integer, with 0 < raw < 2**128. That is the only form the paying
     library reads exactly (`int(offer["amount"])`), so it is the only form the
     dry run calls payable. Any other present amount - `1e26`, `0.5`, a JSON
@@ -236,11 +237,13 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
             # that raises. And `int()` refuses text over 4300 digits, leading zeros
             # included, so "0" * 4300 + "1" was quoted payable at 1 raw likewise. An
             # amount is priced only when `int()` itself reads it, the stripped text
-            # is ASCII digits, and the two agree. The length cap comes first, so
-            # `int()` never sees text long enough to raise on the digit limit.
+            # is ASCII digits, and the two agree. There is no length cap of our own:
+            # text padded with leading zeros or whitespace that `int()` reads is a
+            # payment the library makes, and text over its digit limit raises
+            # ValueError here, exactly as it does there.
             text = amount.strip()
             try:
-                as_int = int(amount) if len(amount) <= MAX_NUMERIC_TEXT else None
+                as_int = int(amount)
             except ValueError:
                 as_int = None
             if as_int is not None and RAW_AMOUNT.match(text):

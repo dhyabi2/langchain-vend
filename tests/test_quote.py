@@ -476,8 +476,8 @@ AGREEMENT_CASES = [
     "0", 0, -3, "-3", "1e26", "+1e26", "1E+26", "1.0e26", "0.5", 1e26, 0.5, 1.0,
     float("inf"), float("nan"), True, False, [], {}, "", "x", "²", "٣", "1_000", "+5",
     str(2 ** 128), 2 ** 128,
-    "12\x1c", "\x1d12", "12\x1e", "12\x1f", "\u200312", "0" * 4300 + "1", "0" * 98 + "12",
-    "0" * 99 + "12", "+5", "+100000000000000000000000000", " +007 ", "+0", "++5", "+ 1",
+    "12\x1c", "\x1d12", "12\x1e", "12\x1f", "\u200312", "0" * 4300 + "1", "0" * 4299 + "1",
+    "0" * 80 + "1" + "0" * 26, " " * 120 + "100000000000000000000000000", "+5", "+100000000000000000000000000", " +007 ", "+0", "++5", "+ 1",
     "-5", "+-5", "+",
 ]
 
@@ -883,12 +883,28 @@ def test_leading_zeros_past_the_int_digit_limit_do_not_raise_out_of_invoke(amoun
 
 
 def test_leading_zeros_on_a_legal_amount_read_only_while_int_can_read_them():
-    """A few leading zeros are fine; 5000 of them are past what `int()` reads."""
-    q = _parse_quote(_nano_offer("0" * 50 + "100000000000000000000000000"))
-    assert q["amount_raw"] == "100000000000000000000000000"
-    assert q["payable"] is True
+    """Padding `int()` reads is fine, however long; 5000 zeros are past its digit limit."""
+    for amount in ["0" * 50 + "100000000000000000000000000",
+                   "0" * 80 + "1" + "0" * 26,
+                   " " * 120 + "100000000000000000000000000",
+                   "0" * 4273 + "100000000000000000000000000"]:          # 4300 digits
+        q = _parse_quote(_nano_offer(amount))
+        assert q["amount_raw"] == "100000000000000000000000000", len(amount)
+        assert q["payable"] is True
     q = _parse_quote(_nano_offer("0" * 5000 + "100000000000000000000000000"))
     assert (q["amount_raw"], q["payable"]) == (None, False)
+
+
+def test_a_megabyte_amount_is_rejected_in_linear_time():
+    """`int()` and `RAW_AMOUNT` both see the whole text now; neither may backtrack."""
+    start = time.perf_counter()
+    for amount in ["1" * 2 ** 20, "1" * 2 ** 20 + "x", " " * 2 ** 20 + "1x", "+" + "1" * 2 ** 20]:
+        q = _parse_quote(_nano_offer(amount))
+        assert q["payable"] is False
+    assert tools.RAW_AMOUNT.match("1" * 2 ** 20 + "x") is None
+    assert time.perf_counter() - start < 1.0
+    q = _parse_quote(_nano_offer(" " * 2 ** 20 + "12"))
+    assert q["amount_raw"] == "12"
 
 
 @pytest.mark.parametrize("sep", ["\x1c", "\x1d", "\x1e", "\x1f"])
