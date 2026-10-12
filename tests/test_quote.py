@@ -11,6 +11,7 @@ import decimal
 import json
 import os
 import sys
+import time
 import types
 from decimal import Decimal
 
@@ -391,7 +392,6 @@ def test_prices_that_already_converted_exactly_are_unchanged():
         ("0.000000000000000000000000000001", 1),           # one raw
         ("123.456", 123456 * 10 ** 27),
         ("0.000000000000000000000000000123", 123),
-        ("0", 0),
     ]:
         q = _parse_quote(_price_only_challenge(price))
         assert q["amount_raw"] == str(expected_raw), (
@@ -519,11 +519,23 @@ def test_a_zero_quote_is_never_handed_to_the_paying_call():
 
 
 def test_the_zero_quote_still_reads_as_unpayable_to_the_agent():
-    # The dry-run read is unchanged: the quote still reports what the seller said.
+    """A zero quote carries no amount_raw and no price, as the README says of every
+    quote with `payable_in_xno` false: `amount_raw is None` means send nothing."""
     quote = _parse_quote(_zero_price_challenge())
-    assert quote["amount_raw"] == "0"
+    assert quote["amount_raw"] is None
+    assert quote["price_xno"] is None
+    assert quote["payable"] is False
     rendered = json.loads(tools._VendTool._quote_json(quote))
-    assert rendered["price_xno"] == "0"
+    assert rendered["payable_in_xno"] is False
+    assert rendered["price_xno"] is None
+    assert rendered["amount_raw"] is None
+    assert "send nothing" in rendered["note"].lower()
+
+
+@pytest.mark.parametrize("price", ["0", 0, 0.0, "0.0", "-0", "0e5"])
+def test_every_zero_price_xno_leaves_the_quote_unpriced(price):
+    q = _parse_quote(_price_only_challenge(price))
+    assert (q["amount_raw"], q["price_xno"], q["payable"]) == (None, None, False)
 
 
 # -- a 402 body that is not the shape x402 specifies is refused, not crashed on ------------------
@@ -797,3 +809,50 @@ def test_an_explicit_zero_amount_tells_the_agent_to_send_nothing():
     rendered = json.loads(_VendTool._quote_json(_parse_quote(_nano_offer("0"))))
     assert rendered["payable_in_xno"] is False
     assert "send nothing" in rendered["note"].lower()
+
+
+# -- a long run of digits is rejected in linear time ------------------------------------------
+#
+# `NUMERIC_TEXT` was `[0-9]+\.?[0-9]*`: with the dot optional, a run of n digits followed by
+# something that is not a number backtracked over every split of the run between the two
+# digit groups, so `"1" * 40000 + "x"` took ~38 s to reject - on the dry-run read.
+
+LONG_NON_NUMBER = "1" * 40000 + "x"
+
+
+def test_a_long_non_numeric_price_xno_is_rejected_quickly():
+    start = time.perf_counter()
+    q = _parse_quote(_price_only_challenge(LONG_NON_NUMBER))
+    assert time.perf_counter() - start < 0.5
+    assert (q["amount_raw"], q["payable"]) == (None, False)
+
+
+def test_a_long_non_numeric_amount_is_rejected_quickly():
+    start = time.perf_counter()
+    q = _parse_quote(_nano_offer(LONG_NON_NUMBER))
+    assert time.perf_counter() - start < 0.5
+    assert (q["amount_raw"], q["payable"]) == (None, False)
+
+
+def test_the_numeric_pattern_itself_is_linear():
+    """Without the length cap in front of it, the pattern alone must still be fast."""
+    start = time.perf_counter()
+    assert tools.NUMERIC_TEXT.match(LONG_NON_NUMBER) is None
+    assert tools.NUMERIC_TEXT.match("1" * 40000 + ".5x") is None
+    assert time.perf_counter() - start < 0.5
+
+
+@pytest.mark.parametrize("text,ok", [
+    ("1e26", True), ("0.0001", True), ("+1e26", True), (".5", True), ("1.", True),
+    ("-5", True), ("1.5e-3", True), ("1..5", False), (".", False), ("e5", False),
+    ("1e", False), ("1_0", False), ("٣", False), ("", False), ("1.2.3", False),
+])
+def test_the_numeric_pattern_accepts_exactly_what_it_did(text, ok):
+    assert bool(tools.NUMERIC_TEXT.match(text)) is ok
+
+
+def test_numeric_text_over_the_length_cap_is_refused():
+    assert tools._numeric_text("0" * 99 + "1") is not None
+    assert tools._numeric_text("0" * 100 + "1") is None
+    q = _parse_quote(_price_only_challenge("0" * 200 + "1"))
+    assert q["amount_raw"] is None

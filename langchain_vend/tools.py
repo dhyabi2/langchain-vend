@@ -70,7 +70,23 @@ RAW_AMOUNT = re.compile(r"^[0-9]+$")
 #: rescue: a seller that wrote the raw amount as `1e26` or `0.0001` still named a price.
 #: Text that is not a number in any notation named nothing, and is refused instead.
 #: ASCII only, for the same reason as above.
-NUMERIC_TEXT = re.compile(r"^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$")
+#:
+#: The fraction is one optional group, `([0-9]+(\.[0-9]*)?`, not `[0-9]+\.?[0-9]*`: with
+#: the dot optional the two digit runs could split a long run of digits any of n ways, so
+#: `"1" * 40000 + "x"` backtracked quadratically and took ~38 s to reject.
+NUMERIC_TEXT = re.compile(r"^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$")
+
+#: No number this module can price is anywhere near this long (a raw amount is at most
+#: 39 digits; an XNO price at most 39 digits and a point). Longer text is refused before
+#: any pattern or `Decimal()` reads it.
+MAX_NUMERIC_TEXT = 100
+
+
+def _numeric_text(text: str):
+    """`NUMERIC_TEXT.match(text)`, or None for text too long to be a price."""
+    if len(text) > MAX_NUMERIC_TEXT:
+        return None
+    return NUMERIC_TEXT.match(text)
 
 #: No Nano amount is longer than this: the supply is under 2**128 raw, 39 digits.
 #: Text longer than that prices nothing - and `int()` RAISES on text over 4300
@@ -172,7 +188,7 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
             unreadable = True
         elif isinstance(amount, str):
             text = amount.strip()
-            numeric = NUMERIC_TEXT.match(text)
+            numeric = _numeric_text(text)
             if RAW_AMOUNT.match(text):
                 # Normalise ONCE and use the same text for the length test and for
                 # `int()`: CPython's 4300-digit limit counts leading zeros, so testing
@@ -240,7 +256,7 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
                 ctx.prec = 60  # 39 digits of raw with headroom; no legal amount rounds
                 ctx.traps[Inexact] = True
                 text = str(challenge["price_xno"]).strip()
-                if not NUMERIC_TEXT.match(text):
+                if not _numeric_text(text):
                     # `Decimal()` reads Arabic-Indic digits ("\u0661" -> 1) and
                     # underscores ("1_0" -> 10); the raw amount refuses both.
                     raise ValueError("price_xno is not an ASCII decimal number")
@@ -248,8 +264,10 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
                 raw = xno * RAW_PER_XNO
                 # Bounded like the raw amount: no Nano amount reaches 2**128 raw, and
                 # this value becomes the spend cap on the paying call. "1e9" XNO used
-                # to quote a 40-digit amount and "1e4000" a 4031-digit one.
-                if (0 <= raw < MAX_RAW_EXCLUSIVE
+                # to quote a 40-digit amount and "1e4000" a 4031-digit one. A price of
+                # zero prices nothing either: it leaves `amount_raw` None like every
+                # other unpayable quote, so `amount_raw is None` means "send nothing".
+                if (0 < raw < MAX_RAW_EXCLUSIVE
                         and raw == raw.to_integral_value()):
                     amount_raw = str(int(raw))
             if amount_raw is not None:
@@ -264,9 +282,10 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
         "network": a0.get("network"),
         "pay_to": _pay_to_of(a0),
         "scheme": a0.get("scheme"),
-        # A quote of zero still reports what the seller said, but it is not
-        # payable: the paying call refuses it, so the dry-run read must not say
-        # "Send exactly amount_raw" (follow-up to #9).
+        # A quote of zero is not payable: the paying call refuses it, so the
+        # dry-run read must not say "Send exactly amount_raw" (follow-up to #9).
+        # Every path above already leaves a zero amount unpriced (`amount_raw`
+        # None); the `> 0` test is kept as a backstop.
         "payable": offer is not None and amount_raw is not None and int(amount_raw) > 0,
     }
 
