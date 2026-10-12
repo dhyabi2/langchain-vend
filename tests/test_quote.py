@@ -641,3 +641,49 @@ def test_a_well_formed_402_is_untouched_by_the_type_checks():
     # a tuple is a list of offers too
     q = _parse_quote({"accepts": tuple(VEND_402["accepts"])})
     assert q["payable"] is True
+
+
+# Post-merge review of #10 (follow-up): three inputs still crashed the read or
+# priced a payment from text that is not an ASCII amount.
+
+_OFFER = dict(VEND_402["accepts"][0])
+
+
+def test_a_raw_amount_longer_than_any_nano_balance_is_unpriced_not_a_crash():
+    """`int()` refuses text over 4300 digits with ValueError, which came out of
+    the dry-run read; a 4000-digit amount was quoted payable. No Nano amount is
+    longer than 39 digits (2**128 - 1 raw), so anything longer prices nothing."""
+    for digits in (40, 4000, 4400):
+        q = _parse_quote({"accepts": [dict(_OFFER, amount="9" * digits)]})
+        assert q["payable"] is False
+        assert q["amount_raw"] is None
+    assert _parse_quote({"accepts": [dict(_OFFER, amount=10 ** 3000)]})["payable"] is False
+    biggest = str(2 ** 128 - 1)
+    assert _parse_quote({"accepts": [dict(_OFFER, amount=biggest)]})["amount_raw"] == biggest
+
+
+def test_a_402_body_nested_too_deep_for_json_is_an_unpriced_quote():
+    class _R:
+        status_code = 402
+
+        def json(self):
+            raise RecursionError("maximum recursion depth exceeded")
+
+    original = tools.httpx.get
+    tools.httpx.get = lambda *a, **k: _R()
+    try:
+        rendered = json.loads(tools.VendWebSearch().invoke({"q": "nano"}))
+    finally:
+        tools.httpx.get = original
+    assert rendered["payable_in_xno"] is False
+    assert rendered["amount_raw"] is None
+
+
+@pytest.mark.parametrize("price", ["١", "1_0", "١.٠"])
+def test_a_price_xno_that_is_not_ascii_decimal_prices_nothing(price):
+    """`Decimal()` reads Arabic-Indic digits and underscores; the raw `amount`
+    already refuses both. The fallback field now holds to the same rule."""
+    offer = {k: v for k, v in _OFFER.items() if k != "amount"}
+    q = _parse_quote({"price_xno": price, "accepts": [offer]})
+    assert q["payable"] is False
+    assert q["amount_raw"] is None

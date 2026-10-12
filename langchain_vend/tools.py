@@ -72,6 +72,11 @@ RAW_AMOUNT = re.compile(r"^[0-9]+$")
 #: ASCII only, for the same reason as above.
 NUMERIC_TEXT = re.compile(r"^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$")
 
+#: No Nano amount is longer than this: the supply is under 2**128 raw, 39 digits.
+#: Text longer than that prices nothing - and `int()` RAISES on text over 4300
+#: digits, which came out of the dry-run read as ValueError.
+MAX_RAW_DIGITS = len(str(2 ** 128 - 1))
+
 
 def raw_to_xno(raw: int) -> str:
     """Integer raw -> exact decimal XNO string. Never a float: at 10**30 raw to
@@ -158,7 +163,9 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
         elif isinstance(amount, str):
             text = amount.strip()
             if RAW_AMOUNT.match(text):
-                if int(text) > 0:
+                if len(text.lstrip("0")) > MAX_RAW_DIGITS:
+                    unreadable = True
+                elif int(text) > 0:
                     amount_raw = str(int(text))
                     price_xno = raw_to_xno(int(amount_raw))
             elif not NUMERIC_TEXT.match(text):
@@ -168,6 +175,8 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
                 # ask the price. An offer whose amount says nothing is priced by
                 # nothing: the `price_xno` fallback below is not asked to invent one.
                 unreadable = True
+        elif isinstance(amount, int) and amount >= 2 ** 128:
+            unreadable = True  # a JSON integer no Nano amount can be
         elif isinstance(amount, int) and amount > 0:
             amount_raw = str(amount)
             price_xno = raw_to_xno(amount)
@@ -197,7 +206,12 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
             with localcontext() as ctx:
                 ctx.prec = 60  # 39 digits of raw with headroom; no legal amount rounds
                 ctx.traps[Inexact] = True
-                xno = Decimal(str(challenge["price_xno"]))
+                text = str(challenge["price_xno"]).strip()
+                if not NUMERIC_TEXT.match(text):
+                    # `Decimal()` reads Arabic-Indic digits ("\u0661" -> 1) and
+                    # underscores ("1_0" -> 10); the raw amount refuses both.
+                    raise ValueError("price_xno is not an ASCII decimal number")
+                xno = Decimal(text)
                 raw = xno * RAW_PER_XNO
                 if xno >= 0 and raw == raw.to_integral_value():
                     amount_raw = str(int(raw))
@@ -283,7 +297,7 @@ class _VendTool(BaseTool):
         if resp.status_code == 402:
             try:
                 challenge = resp.json()
-            except ValueError:
+            except (ValueError, RecursionError):
                 # A 402 whose body is not JSON at all (an HTML error page from a
                 # proxy in front of the seller is the common one) priced nothing.
                 # `resp.json()` raised out of the dry-run read, so the agent got a
