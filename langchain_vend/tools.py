@@ -118,7 +118,24 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
     must not be handed an XNO amount to send, even when the body happens to
     carry a `price_xno` field as well.
     """
-    accepts = challenge.get("accepts") or []
+    if not isinstance(challenge, dict):
+        # A 402 whose body is a JSON array (or any other non-object) has no
+        # `accepts` to read. `challenge.get` raised AttributeError straight out
+        # of this function - on the dry-run read too, where the whole point is to
+        # learn the price while spending nothing. A body that is not an object
+        # named no offer: the quote is unpriced.
+        challenge = {}
+    accepts = challenge.get("accepts")
+    if not isinstance(accepts, (list, tuple)):
+        # x402 `accepts` is an ARRAY of offers. A seller that sent an object
+        # instead (`{"0": {...}}`, which is what several JSON encoders produce
+        # for a map keyed by index) reached `accepts[0]` below and raised
+        # `KeyError: 0`; a number reached it and raised TypeError. Both came out
+        # of the price read, so an agent could not even ask what the call costs.
+        # An `accepts` that is not a list of offers carries no offer we can pay:
+        # the quote is unpriced, `payable` is False, and `_call_vend` refuses
+        # with "no payable XNO offer" before a wallet is handed over.
+        accepts = []
     offer = next((a for a in accepts if _payable(a)), None)
     if offer is not None:
         a0 = offer
@@ -264,7 +281,16 @@ class _VendTool(BaseTool):
         url = self._endpoint
         resp = httpx.get(url, params=params, timeout=30)
         if resp.status_code == 402:
-            challenge = resp.json()
+            try:
+                challenge = resp.json()
+            except ValueError:
+                # A 402 whose body is not JSON at all (an HTML error page from a
+                # proxy in front of the seller is the common one) priced nothing.
+                # `resp.json()` raised out of the dry-run read, so the agent got a
+                # JSONDecodeError where it asked for a price; it now gets an
+                # unpriced quote, and the paying call refuses as it does for any
+                # 402 that carries no payable XNO offer.
+                challenge = {}
             quote = _parse_quote(challenge)
             if not self.wallet or self.dry_run:
                 raise Vend402Quote(quote)

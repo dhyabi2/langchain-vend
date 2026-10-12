@@ -522,3 +522,122 @@ def test_the_zero_quote_still_reads_as_unpayable_to_the_agent():
     assert quote["amount_raw"] == "0"
     rendered = json.loads(tools._VendTool._quote_json(quote))
     assert rendered["price_xno"] == "0"
+
+
+# -- a 402 body that is not the shape x402 specifies is refused, not crashed on ------------------
+#
+# `_parse_quote` read `challenge.get("accepts")` and then `accepts[0]`. Neither read
+# checked a type. x402 says `accepts` is an ARRAY of offers, but a seller is free to
+# send whatever it likes, and what came back decided whether an agent could ask the
+# price at all:
+#
+#   `"accepts": {"0": {...}}`   ->  KeyError: 0          (a map keyed by index: what
+#                                                         several JSON encoders emit
+#                                                         for a list)
+#   `"accepts": 1`              ->  TypeError: 'int' object is not iterable
+#   a body that is a JSON array ->  AttributeError: 'list' object has no attribute 'get'
+#   a body that is not JSON     ->  json.JSONDecodeError out of `resp.json()`
+#
+# Each one raised out of the DRY-RUN read, where the whole point is to learn the price
+# while spending nothing. A malformed 402 is now an unpriced quote: `payable` False, the
+# agent told to send nothing, and the paying call refusing with the message a 402 that
+# priced nothing already gets. These only ever narrow what can be paid.
+
+
+def _xno_offer():
+    return json.loads(json.dumps(VEND_402["accepts"][0]))
+
+
+@pytest.mark.parametrize("accepts", [
+    {"0": _xno_offer()},          # a map keyed by index
+    {"offer": _xno_offer()},      # a map keyed by name
+    {},                           # an empty map
+    1,                            # a number
+    1.5,
+    True,
+])
+def test_an_accepts_that_is_not_a_list_is_refused_not_crashed_on(accepts):
+    q = _parse_quote({"price_xno": 0.0001, "pay_to": TREASURY, "accepts": accepts})
+    assert q["payable"] is False
+    assert q["amount_raw"] is None
+    assert q["price_xno"] is None
+
+
+def test_a_402_body_that_is_not_a_json_object_is_refused_not_crashed_on():
+    for body in ([_xno_offer()], [], "payment required", 402, None):
+        q = _parse_quote(body)
+        assert q["payable"] is False, repr(body)
+        assert q["amount_raw"] is None
+
+
+def test_a_malformed_402_never_reaches_the_paying_call():
+    """A shape that used to raise KeyError now refuses where every other unpriced
+    402 refuses, with no block signed and nothing handed to `request_with_payment`."""
+    reached = {}
+
+    class _W:
+        pass
+
+    class _R:
+        status_code = 402
+        text = ""
+
+        def json(self):
+            return {"price_xno": 0.0001, "accepts": {"0": _xno_offer()}}
+
+    def _request_with_payment(method, url, wallet, rpc, max_raw, **kwargs):
+        reached["max_raw"] = max_raw
+        raise AssertionError(f"the spend path was reached with max_raw={max_raw!r}")
+
+    x402 = types.ModuleType("nano_pay.x402")
+    x402.request_with_payment = _request_with_payment
+    rpc_mod = types.ModuleType("nano_pay.rpc")
+    rpc_mod.RPC = lambda *a, **k: None
+
+    original_get, original_mods = tools.httpx.get, {k: sys.modules.get(k) for k in
+                                                    ("nano_pay.x402", "nano_pay.rpc")}
+    tools.httpx.get = lambda *a, **k: _R()
+    sys.modules["nano_pay.x402"], sys.modules["nano_pay.rpc"] = x402, rpc_mod
+    try:
+        with pytest.raises(RuntimeError, match="no payable XNO offer"):
+            tools.VendWebSearch(wallet=_W(), dry_run=False).invoke({"q": "nano"})
+    finally:
+        tools.httpx.get = original_get
+        for name, module in original_mods.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    assert "max_raw" not in reached
+
+
+def test_a_402_whose_body_is_not_json_is_an_unpriced_quote_not_a_decode_error():
+    class _R:
+        status_code = 402
+        text = "<html>502 Bad Gateway</html>"
+
+        def json(self):
+            raise json.JSONDecodeError("Expecting value", self.text, 0)
+
+    original = tools.httpx.get
+    tools.httpx.get = lambda *a, **k: _R()
+    try:
+        rendered = json.loads(tools.VendWebSearch().invoke({"q": "nano"}))
+    finally:
+        tools.httpx.get = original
+    assert rendered["requires_payment"] is True
+    assert rendered["payable_in_xno"] is False
+    assert rendered["amount_raw"] is None
+    assert "send nothing" in rendered["note"]
+
+
+def test_a_well_formed_402_is_untouched_by_the_type_checks():
+    """The fix narrows nothing that was already payable."""
+    q = _parse_quote(VEND_402)
+    assert q["payable"] is True
+    assert q["amount_raw"] == "100000000000000000000000000"
+    assert q["pay_to"] == TREASURY
+    # a tuple is a list of offers too
+    q = _parse_quote({"accepts": tuple(VEND_402["accepts"])})
+    assert q["payable"] is True
