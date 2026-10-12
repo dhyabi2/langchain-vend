@@ -140,13 +140,14 @@ def test_price_xno_with_no_accepts_at_all_yields_no_amount():
 
 
 def test_price_xno_still_rescues_a_nano_offer_whose_raw_amount_is_unusable():
-    """The fallback's real job: a Nano offer whose `amount` is not an integer
-    string. The destination is the Nano offer's own, so this stays payable."""
+    """The fallback's real job: a Nano offer that carries no `amount` at all. The
+    destination is the Nano offer's own, so this stays payable. (An `amount` that
+    is present, in any notation, is the price itself and is never replaced.)"""
     challenge = {
         "price_xno": 0.0001,
         "accepts": [
             {"scheme": "exact", "network": "nano:mainnet", "asset": "XNO",
-             "amount": "1e26", "payTo": TREASURY}
+             "payTo": TREASURY}
         ],
     }
     q = _parse_quote(challenge)
@@ -433,17 +434,56 @@ def test_an_ascii_integer_amount_is_unchanged():
         assert q["payable"] is True
 
 
-def test_a_numeric_amount_in_another_notation_is_still_rescued_by_price_xno():
-    """`1e26` is a number, just not an integer raw string: the seller did name a
-    price, and this repository deliberately rescues it from `price_xno`
-    (test_price_xno_still_rescues_a_nano_offer_whose_raw_amount_is_unusable).
-    Only a POSITIVE number is rescued: an explicit zero or negative amount is a
-    price the seller named, and it is refused rather than overruled
-    (test_an_explicit_non_positive_amount_is_unpriced_not_rescued)."""
-    for amount in ["1e26", "0.0001", "+1e26", ".5"]:
-        q = _parse_quote(_nano_offer(amount))
-        assert q["amount_raw"] == "100000000000000000000000000", amount
-        assert q["payable"] is True
+def _nano_offer_priced(amount, price_xno):
+    challenge = _nano_offer(amount)
+    challenge["price_xno"] = price_xno
+    return challenge
+
+
+@pytest.mark.parametrize("amount", ["1e26", "+1e26", "1E+26", "100000000000000000000000000.0",
+                                    "1.0e26", 1e26])
+def test_a_whole_raw_amount_in_another_notation_is_read_exactly(amount):
+    """`1e26` is the seller's price in another notation. It used to be ignored and
+    `price_xno` read instead; beside `price_xno: 5` that quoted - and capped the
+    payment at - 5 XNO, a price the offer never named."""
+    q = _parse_quote(_nano_offer_priced(amount, "5"))
+    assert q["amount_raw"] == "100000000000000000000000000", amount
+    assert q["price_xno"] == "0.0001"
+    assert q["payable"] is True
+
+
+@pytest.mark.parametrize("amount", ["0.0001", ".5", "0.5", "1e-99", "1e999999", "1e999999999",
+                                    "1.5", 0.5, 1e-99, 1e300, float("inf"), float("-inf"),
+                                    "3.4028236692093846346337460743176821145600001e38"])
+def test_an_amount_in_another_notation_that_is_not_a_whole_raw_amount_is_unpriced(amount):
+    """A fraction of a raw, or a number past the Nano supply, prices nothing; the
+    `price_xno` beside it must not stand in for it."""
+    q = _parse_quote(_nano_offer_priced(amount, "5"))
+    assert (q["amount_raw"], q["price_xno"], q["payable"]) == (None, None, False), amount
+
+
+def test_a_json_infinity_amount_is_refused_through_invoke():
+    """Python's `json` reads a bare `Infinity` as float('inf'). It used to pass the
+    `> 0` test, reach the `price_xno` fallback and quote 1 XNO as payable."""
+    body = ('{"price_xno": "1", "accepts": [{"scheme": "exact", "network": "nano:mainnet", '
+            '"asset": "XNO", "amount": Infinity, "payTo": "%s"}]}' % TREASURY)
+
+    class _R:
+        status_code = 402
+        text = body
+
+        def json(self):
+            return json.loads(body)
+
+    original = tools.httpx.get
+    tools.httpx.get = lambda *a, **k: _R()
+    try:
+        out = json.loads(tools.VendWebSearch().invoke({"q": "nano"}))
+    finally:
+        tools.httpx.get = original
+    assert out["payable_in_xno"] is False
+    assert out["amount_raw"] is None
+    assert out["price_xno"] is None
 
 
 def test_a_missing_amount_is_still_rescued_by_price_xno():
