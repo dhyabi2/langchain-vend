@@ -476,14 +476,34 @@ AGREEMENT_CASES = [
     "0", 0, -3, "-3", "1e26", "+1e26", "1E+26", "1.0e26", "0.5", 1e26, 0.5, 1.0,
     float("inf"), float("nan"), True, False, [], {}, "", "x", "²", "٣", "1_000", "+5",
     str(2 ** 128), 2 ** 128,
+    "12\x1c", "\x1d12", "12\x1e", "12\x1f", "\u200312", "0" * 4300 + "1", "0" * 98 + "12",
+    "0" * 99 + "12", "+5", "+100000000000000000000000000", " +007 ", "+0", "++5", "+ 1",
+    "-5", "+-5", "+",
 ]
+
+
+@pytest.mark.parametrize("amount,expected", [
+    ("+5", "5"), ("+100000000000000000000000000", "100000000000000000000000000"),
+    (" +007 ", "7"),
+])
+def test_a_single_leading_plus_is_integer_raw(amount, expected):
+    """`int()` - and so the paying library - reads "+100" as 100."""
+    q = _parse_quote(_nano_offer(amount))
+    assert q["amount_raw"] == expected
+    assert q["payable"] is True
+
+
+@pytest.mark.parametrize("amount", ["+0", "++5", "+ 1", "-5", "+-5", "+", "+" + str(2 ** 128)])
+def test_other_signs_are_still_refused(amount):
+    q = _parse_quote(_nano_offer(amount))
+    assert (q["amount_raw"], q["payable"]) == (None, False)
 
 
 @pytest.mark.parametrize("amount", AGREEMENT_CASES, ids=[repr(a)[:30] for a in AGREEMENT_CASES])
 def test_a_dry_run_called_payable_is_a_payment_nano_pay_can_make(amount):
     """Whenever the dry run says "Send exactly amount_raw", nano_pay's own read of the
     same offer yields exactly that amount. The converse is deliberately looser: this
-    package also refuses some text `int()` accepts ("+5", "1_000", "٣") and anything
+    package also refuses some text `int()` accepts ("1_000", "٣") and anything
     at or above 2**128 raw, which only narrows what can be paid. A missing or null
     amount is not covered: that is the `price_xno` fallback, unchanged here."""
     q = _parse_quote(_nano_offer_priced(amount, "5"))
@@ -830,13 +850,14 @@ def test_a_zero_price_xno_is_never_shown_to_the_agent_as_payable(price):
 # or through the `price_xno` fallback - which becomes the spend cap on the paying call.
 
 
-LEADING_ZEROS = [("0" * 4300 + "1", "1"), ("0" * 5000, None), ("0" * 4400 + "9" * 39, None)]
+LEADING_ZEROS = [("0" * 4300 + "1", None), ("0" * 5000, None), ("0" * 4400 + "9" * 39, None)]
 
 
 @pytest.mark.parametrize("amount,expected", LEADING_ZEROS, ids=["4300z+1", "5000z", "4400z+9x39"])
 def test_leading_zeros_past_the_int_digit_limit_do_not_raise(amount, expected):
-    """Leading zeros are not digits of the amount: `"0" * 4300 + "1"` is one raw.
-    Zero is refused (an explicit zero prices nothing) and 39 nines are above 2**128."""
+    """None of these may raise. `"0" * 4300 + "1"` is one raw, but the paying library's
+    `int()` refuses text over 4300 digits, leading zeros included, so it is unpriced;
+    zero prices nothing; 39 nines are above 2**128."""
     q = _parse_quote(_nano_offer(amount))          # must not raise
     assert q["amount_raw"] == expected
     assert q["payable"] is (expected is not None)
@@ -861,10 +882,28 @@ def test_leading_zeros_past_the_int_digit_limit_do_not_raise_out_of_invoke(amoun
     assert out["payable_in_xno"] is (expected is not None)
 
 
-def test_leading_zeros_on_a_legal_amount_still_read():
-    q = _parse_quote(_nano_offer("0" * 5000 + "100000000000000000000000000"))
+def test_leading_zeros_on_a_legal_amount_read_only_while_int_can_read_them():
+    """A few leading zeros are fine; 5000 of them are past what `int()` reads."""
+    q = _parse_quote(_nano_offer("0" * 50 + "100000000000000000000000000"))
     assert q["amount_raw"] == "100000000000000000000000000"
     assert q["payable"] is True
+    q = _parse_quote(_nano_offer("0" * 5000 + "100000000000000000000000000"))
+    assert (q["amount_raw"], q["payable"]) == (None, False)
+
+
+@pytest.mark.parametrize("sep", ["\x1c", "\x1d", "\x1e", "\x1f"])
+def test_separator_characters_int_refuses_are_not_stripped_into_a_price(sep):
+    """`str.strip()` removes U+001C..U+001F; `int()` does not accept them."""
+    for amount in ["12" + sep, sep + "12", sep + "12" + sep]:
+        q = _parse_quote(_nano_offer(amount))
+        assert (q["amount_raw"], q["payable"]) == (None, False), repr(amount)
+
+
+def test_whitespace_int_accepts_still_reads():
+    for amount in [" 12 ", "\t12\n", "\u200312\u3000", "\x0b12\x0c"]:
+        assert int(amount) == 12
+        q = _parse_quote(_nano_offer(amount))
+        assert q["amount_raw"] == "12", repr(amount)
 
 
 @pytest.mark.parametrize("price", ["1e9", "1e4000", 1e300, "340282366.920938463463374607431768211456"])

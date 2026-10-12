@@ -64,7 +64,9 @@ RAW_PER_XNO = 10 ** 30
 #: U+00B2, '4' as U+2074, the Ethiopic digits), and true for the non-ASCII decimal digits
 #: `int()` happily converts (U+0663 -> 3), so an amount written in no ASCII at all could
 #: price a payment. `[0-9]` and not `\d`, because `re` matches Unicode digits by default.
-RAW_AMOUNT = re.compile(r"^[0-9]+$")
+#: One optional leading "+" is allowed: `int("+100")` reads it as 100, as the paying
+#: library does. "-", "++" and "+ 1" are not integer raw.
+RAW_AMOUNT = re.compile(r"^\+?[0-9]+$")
 
 #: An ASCII decimal number in any notation (`0.0001`, `1e-4`). This only checks that
 #: `price_xno` text IS an ASCII number before `Decimal()` reads it - `Decimal()` would
@@ -173,8 +175,9 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
     `Decimal(str(...))` so the quote leaving this function is never a float.
 
     An `amount` that is present is the price, and it must be an integer number
-    of raw: ASCII digit text (leading zeros and surrounding spaces allowed) or a
-    JSON integer, with 0 < raw < 2**128. That is the only form the paying
+    of raw: ASCII digit text that `int()` itself reads to the same value (at
+    most 100 characters, leading zeros and the whitespace `int()` accepts
+    allowed) or a JSON integer, with 0 < raw < 2**128. That is the only form the paying
     library reads exactly (`int(offer["amount"])`), so it is the only form the
     dry run calls payable. Any other present amount - `1e26`, `0.5`, a JSON
     float (even 1e26), Infinity, NaN, zero, negative, not a number - makes the
@@ -227,18 +230,27 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
             # paying call raised ValueError. `true` is not an amount: nothing is priced.
             pass
         elif isinstance(amount, str):
+            # Parity with the paying library, which reads `int(offer["amount"])` on
+            # the UNSTRIPPED text. `str.strip()` also removes U+001C..U+001F, which
+            # `int()` refuses, so "12\x1c" was quoted payable at 12 raw for a payment
+            # that raises. And `int()` refuses text over 4300 digits, leading zeros
+            # included, so "0" * 4300 + "1" was quoted payable at 1 raw likewise. An
+            # amount is priced only when `int()` itself reads it, the stripped text
+            # is ASCII digits, and the two agree. The length cap comes first, so
+            # `int()` never sees text long enough to raise on the digit limit.
             text = amount.strip()
-            if RAW_AMOUNT.match(text):
-                # Normalise ONCE and use the same text for the length test and for
-                # `int()`: CPython's 4300-digit limit counts leading zeros, so testing
-                # the stripped text and converting the unstripped one let
-                # `"0" * 4300 + "1"` through to a ValueError.
-                digits = text.lstrip("0") or "0"
+            try:
+                as_int = int(amount) if len(amount) <= MAX_NUMERIC_TEXT else None
+            except ValueError:
+                as_int = None
+            if as_int is not None and RAW_AMOUNT.match(text):
+                digits = text[1:] if text.startswith("+") else text
+                digits = digits.lstrip("0") or "0"
                 if len(digits) > MAX_RAW_DIGITS or int(digits) >= MAX_RAW_EXCLUSIVE:
                     # The same bound as a JSON integer: 2**128 and "9" * 39 are no
                     # more a Nano amount as text than as a number.
                     pass
-                elif int(digits) > 0:
+                elif int(digits) > 0 and int(digits) == as_int:
                     amount_raw = digits
                     price_xno = raw_to_xno(int(digits))
                 else:
