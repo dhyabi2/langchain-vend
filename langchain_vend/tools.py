@@ -30,7 +30,6 @@ spending nothing: paying is opt-in and this branch does not change that.
 """
 
 import json
-import math
 import os
 import re
 from decimal import Decimal, Inexact, Overflow, localcontext
@@ -67,10 +66,11 @@ RAW_PER_XNO = 10 ** 30
 #: price a payment. `[0-9]` and not `\d`, because `re` matches Unicode digits by default.
 RAW_AMOUNT = re.compile(r"^[0-9]+$")
 
-#: A number in SOME notation, which is what the `price_xno` fallback below exists to
-#: rescue: a seller that wrote the raw amount as `1e26` or `0.0001` still named a price.
-#: Text that is not a number in any notation named nothing, and is refused instead.
-#: ASCII only, for the same reason as above.
+#: An ASCII decimal number in any notation (`0.0001`, `1e-4`). This only checks that
+#: `price_xno` text IS an ASCII number before `Decimal()` reads it - `Decimal()` would
+#: also take Arabic-Indic digits and underscores. It is not a rescue path for an offer
+#: `amount`: an amount must be integer raw (`RAW_AMOUNT`), the only form the paying
+#: library (`int(offer["amount"])`) reads exactly.
 #:
 #: The fraction is one optional group, `([0-9]+(\.[0-9]*)?`, not `[0-9]+\.?[0-9]*`: with
 #: the dot optional the two digit runs could split a long run of digits any of n ways, so
@@ -90,20 +90,27 @@ def _numeric_text(text: str):
     return NUMERIC_TEXT.match(text)
 
 
-def _exact_raw(text: str, scale: int) -> Optional[int]:
-    """`text` (ASCII numeric, any notation) times `scale`, as a raw amount - or None.
+def _exact_raw(value: Any, scale: int) -> Optional[int]:
+    """`str(value)` (ASCII numeric, any notation) times `scale`, as a raw amount - or None.
 
     None unless the product is EXACTLY an integer with 0 < raw < 2**128. The
     arithmetic runs in its own context (precision 60, `Inexact` and `Overflow`
     trapped): the default 28 digits silently rounds a 39-digit raw amount, and a
     rounded value can still look integral, so a price could become a cap one raw
     short of, or hundreds of raw above, what was quoted.
+
+    `str()` itself runs inside the `try`: a value it cannot render (a deeply
+    nested list raises RecursionError) prices nothing rather than raising out of
+    the price read.
     """
-    if not _numeric_text(text):
-        # `Decimal()` reads Arabic-Indic digits ("\u0661" -> 1) and underscores
-        # ("1_0" -> 10); the raw amount refuses both.
-        return None
     try:
+        if isinstance(value, bool):
+            return None  # `true` is not a price, though `bool` is an `int`
+        text = str(value).strip()
+        if not _numeric_text(text):
+            # `Decimal()` reads Arabic-Indic digits ("\u0661" -> 1) and underscores
+            # ("1_0" -> 10); the raw amount refuses both.
+            return None
         with localcontext() as ctx:
             ctx.prec = 60  # 39 digits of raw with headroom; no legal amount rounds
             ctx.traps[Inexact] = True
@@ -111,7 +118,7 @@ def _exact_raw(text: str, scale: int) -> Optional[int]:
             raw = Decimal(text) * scale
             if 0 < raw < MAX_RAW_EXCLUSIVE and raw == raw.to_integral_value():
                 return int(raw)
-    except Exception:  # decimal.Inexact, Overflow, InvalidOperation and friends
+    except Exception:  # Inexact, Overflow, InvalidOperation, RecursionError, ...
         pass
     return None
 
@@ -165,12 +172,14 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
     offer exists and its `amount` is missing (or null). It is rendered through
     `Decimal(str(...))` so the quote leaving this function is never a float.
 
-    An `amount` that is present is the price, whatever notation it is in: `1e26`
-    (text or a JSON number) is read exactly as 10**26 raw. A present amount that
-    is not exactly a whole, positive number of raw - zero, negative, `0.5`,
-    `1e-99`, Infinity, NaN, not a number at all - makes the quote unpriced: the
-    `price_xno` fallback never overrules, or stands in for, a price the seller
-    named in the offer.
+    An `amount` that is present is the price, and it must be an integer number
+    of raw: ASCII digit text (leading zeros and surrounding spaces allowed) or a
+    JSON integer, with 0 < raw < 2**128. That is the only form the paying
+    library reads exactly (`int(offer["amount"])`), so it is the only form the
+    dry run calls payable. Any other present amount - `1e26`, `0.5`, a JSON
+    float (even 1e26), Infinity, NaN, zero, negative, not a number - makes the
+    quote unpriced: the `price_xno` fallback never overrules, or stands in for,
+    a price the seller named in the offer.
 
     Every raw amount, whichever path it comes from, must be below 2**128 (the
     Nano supply bound); anything at or above it leaves the quote unpriced.
@@ -219,7 +228,6 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
             pass
         elif isinstance(amount, str):
             text = amount.strip()
-            numeric = _numeric_text(text)
             if RAW_AMOUNT.match(text):
                 # Normalise ONCE and use the same text for the length test and for
                 # `int()`: CPython's 4300-digit limit counts leading zeros, so testing
@@ -235,23 +243,15 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
                     price_xno = raw_to_xno(int(digits))
                 else:
                     pass  # an explicit amount of zero prices nothing
-            elif not numeric:
-                # Not a number in any notation. This used to be `isdigit()`, which let
-                # 128 such characters through to `int()` and raised ValueError out of
-                # this function - on the dry-run read too, so an agent could not even
-                # ask the price. An offer whose amount says nothing is priced by
-                # nothing: the `price_xno` fallback below is not asked to invent one.
-                pass
             else:
-                # A number in another notation ("1e26", "+1e26", "0.5", "-5"). It is
-                # the seller's price, so it is read exactly; a value that is not a
-                # whole positive raw amount below 2**128 prices nothing. `price_xno`
-                # used to be read instead, so "1e26" beside `price_xno: 5` quoted -
-                # and capped the payment at - 5 XNO.
-                raw = _exact_raw(text, 1)
-                if raw is not None:
-                    amount_raw = str(raw)
-                    price_xno = raw_to_xno(raw)
+                # Not integer raw. This used to be `isdigit()`, which let 128 such
+                # characters through to `int()` and raised ValueError out of this
+                # function - on the dry-run read too. A number in another notation
+                # ("1e26", "0.5") is not priced either: the paying library reads
+                # `int(offer["amount"])`, which raises on "1e26", so a dry run that
+                # called it payable described a payment that cannot happen. And the
+                # `price_xno` fallback below is not asked to stand in for it.
+                pass
         elif isinstance(amount, int):
             if amount >= MAX_RAW_EXCLUSIVE:
                 pass  # a JSON integer no Nano amount can be
@@ -260,16 +260,11 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
                 price_xno = raw_to_xno(amount)
             else:
                 pass  # an explicit 0 or -3 prices nothing
-        elif isinstance(amount, float):
-            # JSON `Infinity` and `NaN` parse to floats; `not inf > 0` is False, so
-            # Infinity used to reach the `price_xno` fallback and quote it payable.
-            raw = (_exact_raw(repr(amount), 1)
-                   if math.isfinite(amount) and amount > 0 else None)
-            if raw is not None:  # 0.0, -1.5, 0.5, NaN and Infinity price nothing
-                amount_raw = str(raw)
-                price_xno = raw_to_xno(raw)
         elif amount is not None:
-            pass  # a list, an object: present, and no amount at all
+            # A JSON float (1e26, 0.5, Infinity, NaN), a list, an object: present,
+            # and not integer raw. `int(1e26)` is 100000000000000004764729344, so
+            # the paying library would read a different amount than was quoted.
+            pass
 
     if (offer is not None and offer.get("amount") is None
             and challenge.get("price_xno") is not None):
@@ -298,7 +293,7 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
         # 40-digit amount and "1e4000" a 4031-digit one. A price of zero prices
         # nothing either: it leaves `amount_raw` None like every other unpayable
         # quote, so `amount_raw is None` means "send nothing".
-        raw = _exact_raw(str(challenge["price_xno"]).strip(), RAW_PER_XNO)
+        raw = _exact_raw(challenge["price_xno"], RAW_PER_XNO)
         if raw is not None:
             amount_raw = str(raw)
             price_xno = raw_to_xno(raw)

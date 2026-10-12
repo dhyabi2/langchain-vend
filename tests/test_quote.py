@@ -440,26 +440,92 @@ def _nano_offer_priced(amount, price_xno):
     return challenge
 
 
-@pytest.mark.parametrize("amount", ["1e26", "+1e26", "1E+26", "100000000000000000000000000.0",
-                                    "1.0e26", 1e26])
-def test_a_whole_raw_amount_in_another_notation_is_read_exactly(amount):
-    """`1e26` is the seller's price in another notation. It used to be ignored and
-    `price_xno` read instead; beside `price_xno: 5` that quoted - and capped the
-    payment at - 5 XNO, a price the offer never named."""
-    q = _parse_quote(_nano_offer_priced(amount, "5"))
-    assert q["amount_raw"] == "100000000000000000000000000", amount
-    assert q["price_xno"] == "0.0001"
-    assert q["payable"] is True
-
-
-@pytest.mark.parametrize("amount", ["0.0001", ".5", "0.5", "1e-99", "1e999999", "1e999999999",
-                                    "1.5", 0.5, 1e-99, 1e300, float("inf"), float("-inf"),
-                                    "3.4028236692093846346337460743176821145600001e38"])
-def test_an_amount_in_another_notation_that_is_not_a_whole_raw_amount_is_unpriced(amount):
-    """A fraction of a raw, or a number past the Nano supply, prices nothing; the
-    `price_xno` beside it must not stand in for it."""
+@pytest.mark.parametrize("amount", [
+    # A whole raw amount in another notation: still not integer raw. The paying
+    # library reads `int(offer["amount"])`, which raises on "1e26" and turns the
+    # float 1e26 into 100000000000000004764729344, so neither can be quoted payable.
+    "1e26", "+1e26", "1E+26", "100000000000000000000000000.0", "1.0e26", 1e26,
+    # Fractions, out-of-range and non-finite numbers.
+    "0.0001", ".5", "0.5", "1e-99", "1e999999", "1e999999999", "1.5", 0.5, 1e-99, 1e300,
+    float("inf"), float("-inf"), float("nan"),
+    "3.4028236692093846346337460743176821145600001e38",
+    100000000000000000000000001.5, 123456789012345678901.0,
+])
+def test_an_amount_that_is_not_integer_raw_is_unpriced(amount):
+    """Only integer raw is a price; `price_xno` beside the offer must not stand in
+    for any other amount (beside `price_xno: 5` it once quoted, and capped the
+    payment at, 5 XNO)."""
     q = _parse_quote(_nano_offer_priced(amount, "5"))
     assert (q["amount_raw"], q["price_xno"], q["payable"]) == (None, None, False), amount
+
+
+def _nano_pay_reads(amount):
+    """An inline copy of what `nano_pay.x402.offer_amount_raw` does with an offer
+    amount (feeless402 0.2.13): `int(offer["amount"])`, which must succeed and be
+    positive for a payment to be possible. nano_pay is deliberately not imported."""
+    try:
+        value = int(amount)
+    except Exception:
+        return None
+    return value if value > 0 else None
+
+
+AGREEMENT_CASES = [
+    "100000000000000000000000000", " 100000000000000000000000000 ", "007", "1", 100, 1,
+    str(2 ** 128 - 1), 2 ** 128 - 1, "0" * 50 + "5",
+    "0", 0, -3, "-3", "1e26", "+1e26", "1E+26", "1.0e26", "0.5", 1e26, 0.5, 1.0,
+    float("inf"), float("nan"), True, False, [], {}, "", "x", "²", "٣", "1_000", "+5",
+    str(2 ** 128), 2 ** 128,
+]
+
+
+@pytest.mark.parametrize("amount", AGREEMENT_CASES, ids=[repr(a)[:30] for a in AGREEMENT_CASES])
+def test_a_dry_run_called_payable_is_a_payment_nano_pay_can_make(amount):
+    """Whenever the dry run says "Send exactly amount_raw", nano_pay's own read of the
+    same offer yields exactly that amount. The converse is deliberately looser: this
+    package also refuses some text `int()` accepts ("+5", "1_000", "٣") and anything
+    at or above 2**128 raw, which only narrows what can be paid. A missing or null
+    amount is not covered: that is the `price_xno` fallback, unchanged here."""
+    q = _parse_quote(_nano_offer_priced(amount, "5"))
+    if q["payable"]:
+        assert _nano_pay_reads(amount) == int(q["amount_raw"]), amount
+    if _nano_pay_reads(amount) is None:
+        assert q["payable"] is False, amount
+
+
+@pytest.mark.parametrize("literal", ["100000000000000000000000001.5", "123456789012345678901.0",
+                                     "1e26", "1E+26"])
+def test_a_json_float_amount_is_unpriced_through_invoke(literal):
+    body = ('{"price_xno": "1", "accepts": [{"scheme": "exact", "network": "nano:mainnet", '
+            '"asset": "XNO", "amount": %s, "payTo": "%s"}]}' % (literal, TREASURY))
+
+    class _R:
+        status_code = 402
+        text = body
+
+        def json(self):
+            return json.loads(body)
+
+    original = tools.httpx.get
+    tools.httpx.get = lambda *a, **k: _R()
+    try:
+        out = json.loads(tools.VendWebSearch().invoke({"q": "nano"}))
+    finally:
+        tools.httpx.get = original
+    assert (out["payable_in_xno"], out["amount_raw"], out["price_xno"]) == (False, None, None)
+
+
+def test_a_price_xno_that_str_cannot_render_is_unpriced_not_raised():
+    """`str()` of the fallback value runs inside the guarded conversion: a 50000-deep
+    nested list raises RecursionError from `str()` and must not escape the price read."""
+    deep = []
+    for _ in range(50000):
+        deep = [deep]
+    challenge = _nano_offer(None)
+    del challenge["accepts"][0]["amount"]
+    challenge["price_xno"] = deep
+    q = _parse_quote(challenge)                    # must not raise
+    assert (q["amount_raw"], q["price_xno"], q["payable"]) == (None, None, False)
 
 
 def test_a_json_infinity_amount_is_refused_through_invoke():
