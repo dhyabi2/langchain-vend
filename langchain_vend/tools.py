@@ -227,7 +227,10 @@ def _parse_quote(challenge: Dict[str, Any]) -> Dict[str, Any]:
         "network": a0.get("network"),
         "pay_to": _pay_to_of(a0),
         "scheme": a0.get("scheme"),
-        "payable": offer is not None and amount_raw is not None,
+        # A quote of zero still reports what the seller said, but it is not
+        # payable: the paying call refuses it, so the dry-run read must not say
+        # "Send exactly amount_raw" (follow-up to #9).
+        "payable": offer is not None and amount_raw is not None and int(amount_raw) > 0,
     }
 
 

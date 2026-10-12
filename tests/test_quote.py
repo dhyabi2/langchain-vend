@@ -687,3 +687,16 @@ def test_a_price_xno_that_is_not_ascii_decimal_prices_nothing(price):
     q = _parse_quote({"price_xno": price, "accepts": [offer]})
     assert q["payable"] is False
     assert q["amount_raw"] is None
+
+
+@pytest.mark.parametrize("price", [0, "-0", "0E-30", "0.0"])
+def test_a_zero_price_xno_is_never_shown_to_the_agent_as_payable(price):
+    """Follow-up to #9: the paying call refused a zero quote, but the dry-run
+    read still said payable and "Send exactly amount_raw" with amount_raw "0"."""
+    offer = {k: v for k, v in _OFFER.items() if k != "amount"}
+    for o in (offer, dict(_OFFER, amount="0")):
+        q = _parse_quote({"price_xno": price, "accepts": [o]})
+        assert q["payable"] is False
+        rendered = json.loads(tools._VendTool._quote_json(q))
+        assert rendered["payable_in_xno"] is False
+        assert "send nothing" in rendered["note"]
