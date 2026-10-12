@@ -437,8 +437,10 @@ def test_a_numeric_amount_in_another_notation_is_still_rescued_by_price_xno():
     """`1e26` is a number, just not an integer raw string: the seller did name a
     price, and this repository deliberately rescues it from `price_xno`
     (test_price_xno_still_rescues_a_nano_offer_whose_raw_amount_is_unusable).
-    That path is untouched -- only text that names no number at all is refused."""
-    for amount in ["1e26", "0.0001", "-5", "0", "+1e26", ".5"]:
+    Only a POSITIVE number is rescued: an explicit zero or negative amount is a
+    price the seller named, and it is refused rather than overruled
+    (test_an_explicit_non_positive_amount_is_unpriced_not_rescued)."""
+    for amount in ["1e26", "0.0001", "+1e26", ".5"]:
         q = _parse_quote(_nano_offer(amount))
         assert q["amount_raw"] == "100000000000000000000000000", amount
         assert q["payable"] is True
@@ -700,3 +702,98 @@ def test_a_zero_price_xno_is_never_shown_to_the_agent_as_payable(price):
         rendered = json.loads(tools._VendTool._quote_json(q))
         assert rendered["payable_in_xno"] is False
         assert "send nothing" in rendered["note"]
+
+
+# -- every path to a raw amount is bounded, and none of them raises ---------------------------
+#
+# CPython refuses `int()` on text over 4300 digits and counts leading zeros toward that,
+# so the length test and the conversion must read the same normalised text. And no
+# Nano amount reaches 2**128 raw, whether it arrives as a JSON integer, as integer text
+# or through the `price_xno` fallback - which becomes the spend cap on the paying call.
+
+
+LEADING_ZEROS = [("0" * 4300 + "1", "1"), ("0" * 5000, None), ("0" * 4400 + "9" * 39, None)]
+
+
+@pytest.mark.parametrize("amount,expected", LEADING_ZEROS, ids=["4300z+1", "5000z", "4400z+9x39"])
+def test_leading_zeros_past_the_int_digit_limit_do_not_raise(amount, expected):
+    """Leading zeros are not digits of the amount: `"0" * 4300 + "1"` is one raw.
+    Zero is refused (an explicit zero prices nothing) and 39 nines are above 2**128."""
+    q = _parse_quote(_nano_offer(amount))          # must not raise
+    assert q["amount_raw"] == expected
+    assert q["payable"] is (expected is not None)
+
+
+@pytest.mark.parametrize("amount,expected", LEADING_ZEROS, ids=["4300z+1", "5000z", "4400z+9x39"])
+def test_leading_zeros_past_the_int_digit_limit_do_not_raise_out_of_invoke(amount, expected):
+    class _R:
+        status_code = 402
+        text = ""
+
+        def json(self):
+            return _nano_offer(amount)
+
+    original = tools.httpx.get
+    tools.httpx.get = lambda *a, **k: _R()
+    try:
+        out = json.loads(tools.VendWebSearch().invoke({"q": "nano"}))
+    finally:
+        tools.httpx.get = original
+    assert out["amount_raw"] == expected
+    assert out["payable_in_xno"] is (expected is not None)
+
+
+def test_leading_zeros_on_a_legal_amount_still_read():
+    q = _parse_quote(_nano_offer("0" * 5000 + "100000000000000000000000000"))
+    assert q["amount_raw"] == "100000000000000000000000000"
+    assert q["payable"] is True
+
+
+@pytest.mark.parametrize("price", ["1e9", "1e4000", 1e300, "340282366.920938463463374607431768211456"])
+def test_the_price_xno_fallback_is_bounded_like_a_raw_amount(price):
+    q = _parse_quote(_price_only_challenge(price))
+    assert q["amount_raw"] is None, f"{price!r} XNO was quoted as {q['amount_raw']}"
+    assert q["price_xno"] is None
+    assert q["payable"] is False
+
+
+def test_the_price_xno_fallback_just_below_the_bound_still_reads():
+    price = "340282366.920938463463374607431768211455"   # (2**128 - 1) raw
+    q = _parse_quote(_price_only_challenge(price))
+    assert q["amount_raw"] == str(2 ** 128 - 1)
+    assert q["payable"] is True
+
+
+@pytest.mark.parametrize("amount", [str(2 ** 128), "9" * 39, " " + str(2 ** 128) + " ",
+                                    "0" + str(2 ** 128), 2 ** 128, 10 ** 39 - 1])
+def test_text_and_integer_amounts_share_the_2_pow_128_bound(amount):
+    q = _parse_quote(_nano_offer(amount))
+    assert q["amount_raw"] is None, f"{amount!r} was quoted payable"
+    assert q["payable"] is False
+
+
+@pytest.mark.parametrize("amount", [str(2 ** 128 - 1), 2 ** 128 - 1])
+def test_the_largest_legal_amount_is_unchanged_as_text_and_integer(amount):
+    q = _parse_quote(_nano_offer(amount))
+    assert q["amount_raw"] == str(2 ** 128 - 1)
+    assert q["payable"] is True
+
+
+@pytest.mark.parametrize("amount", ["0", "000", 0, -3, "-3", "-5", "0.0", "-1e26", "+0",
+                                    "0e9", 0.0, -1.5, float("nan"), [], {}, [1]])
+def test_an_explicit_non_positive_amount_is_unpriced_not_rescued(amount):
+    """`_nano_offer` carries `price_xno: 0.0001` beside the offer. An offer that says
+    its amount is zero or negative named a price; the fallback used to replace it with
+    a different one and quote that as payable."""
+    q = _parse_quote(_nano_offer(amount))
+    assert q["amount_raw"] is None, f"{amount!r} was rescued as {q['amount_raw']}"
+    assert q["price_xno"] is None
+    assert q["payable"] is False
+
+
+def test_an_explicit_zero_amount_tells_the_agent_to_send_nothing():
+    from langchain_vend.tools import _VendTool
+
+    rendered = json.loads(_VendTool._quote_json(_parse_quote(_nano_offer("0"))))
+    assert rendered["payable_in_xno"] is False
+    assert "send nothing" in rendered["note"].lower()
