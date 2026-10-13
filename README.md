@@ -44,9 +44,13 @@ result = tool.invoke({"q": "nano cryptocurrency"})
 #  "network": "nano:mainnet", "scheme": "exact", "pay_to": "nano_1yo6..."}
 ```
 
-`payable_in_xno` is false when the 402 asks for some other rail. The quote then
-carries no `amount_raw` and no price, and an agent must send nothing: `asset`
-and `network` say what the seller actually wanted.
+`payable_in_xno` is false when the 402 asks for some other rail, or when its
+Nano offer names no amount these tools can send. An offer amount must be an
+integer number of raw above zero and below 2**128 raw: a JSON integer, or
+integer raw text exactly as Python's `int()` reads it (surrounding whitespace,
+leading zeros and a single leading `+` allowed); `1e26`, `0.5`, a JSON float, or anything that is not a number leaves
+the quote unpriced. The quote then carries no `amount_raw` and no price, and
+an agent must send nothing: `asset` and `network` say what the seller asked for.
 
 Live (pays on the call). A wallet alone is not enough: `dry_run` defaults to
 `True`, so `VendExtract(wallet=w)` still returns the quote and spends nothing.
