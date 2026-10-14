@@ -88,16 +88,23 @@ already treats one as ordinary on the *unpaid* read (`challenge = {}` for a non-
 body, `tools.py:265`). On the paid read it was the one failure that costs money and the one
 with the least information.
 
-The fix raises `VendPaidButNotServed` instead, carrying `receipt`, `block`, `amount_raw`,
-`settled`, `ledger`, `note`, `url`, `status_code` and `body`, and naming the block, the
-amount and the receipt's own verdict (and note) in the message text as well — a LangChain
-agent reads the message far more often than it introspects the exception. The message says
-the XNO was spent only when `settled` is True, says nothing was paid when it is False, and
-says the outcome is unknown otherwise; it warns that calling the tool again can make a new
-payment and never suggests putting the block in `X-PAYMENT`. It keeps the old
-`... after payment: ` prefix and ends with the seller's body (cut to 200 characters), and it
-round-trips through `pickle`, `copy.copy` and `copy.deepcopy`. It subclasses `RuntimeError`, so every handler that caught the old error still
-catches this one, and it is exported from the package.
+The fix raises `VendPaidButNotServed` instead, carrying `receipt`, `block`, `signed`,
+`amount_raw`, `settled`, `ledger`, `note`, `url`, `status_code` and `body`, and naming the
+block, the amount and the receipt's own verdict (and note) in the message text as well — a
+LangChain agent reads the message far more often than it introspects the exception. The
+message keeps main's shape, `Vend {url} -> HTTP {code} after payment: {body}`, with the
+seller's body (cut to 200 characters) straight after the prefix and the explanation after
+` -- `, so handlers matching the old text still match. With no receipt (feeless402 returns
+`(response, None)` without signing anything when the paying read is not a 402) it says no
+payment was signed for this call and names no block. Otherwise it says the XNO was spent only
+when `settled` is True, says nothing was paid when it is False, and says the outcome is
+unknown otherwise. When `settled` is True the library's "re-present this SAME block" note is
+quoted as advice for callers that can re-present a block, which this tool cannot. Every
+signed case warns that calling the tool again can make a new payment and never suggests
+putting the block in `X-PAYMENT`. It subclasses `RuntimeError`, so every handler that caught
+the old error still catches this one, it is exported from the package, and it round-trips
+through `pickle`, `copy.copy` and `copy.deepcopy` with its notes and any attributes a caller
+set.
 
 Nothing about a served 200 changes, and nothing about the refusals before the money moves
 changes: this is strictly about what survives a failure after it.
@@ -106,7 +113,7 @@ changes: this is strictly about what survives a failure after it.
 $ pytest -q tests/test_live_payment.py -k "paid_call or block_hash or runtime_error or no_block or no_receipt or served_200"
   4 failed, 2 passed        # without the fix
 $ pytest -q
-  252 passed                # with it (was 233)
+  259 passed                # with it (was 233)
 ```
 
 The two that pass either way are deliberate: `..._still_a_runtime_error_so_existing_handlers_keep_working`

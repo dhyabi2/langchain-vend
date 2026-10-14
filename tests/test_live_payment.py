@@ -455,6 +455,7 @@ def test_a_receipt_with_no_block_reports_none_rather_than_inventing_one(paid_the
         tool.invoke({"q": "nano cryptocurrency"})
     assert caught.value.block is None
     assert caught.value.receipt == {"settled": False}, "the receipt we did get is still reported"
+    assert caught.value.signed is False
 
 
 def test_no_receipt_at_all_is_an_empty_dict_not_a_crash(paid_then_refused):
@@ -464,6 +465,20 @@ def test_no_receipt_at_all_is_an_empty_dict_not_a_crash(paid_then_refused):
         tool.invoke({"q": "nano cryptocurrency"})
     assert caught.value.receipt == {}
     assert caught.value.block is None
+
+
+def test_no_receipt_says_no_payment_was_signed_and_names_no_null_block(paid_then_refused):
+    # feeless402 returns (response, None) without signing when the paying read
+    # is not a 402: nothing was paid, and there is no block to check.
+    err = _refused(paid_then_refused, None)
+    assert err.signed is False and err.settled is False
+    text = str(err)
+    assert "no payment was signed for this call" in text
+    assert "null" not in text and "None" not in text
+    assert "ledger" not in text and "unknown" not in text and "spent" not in text
+    assert text.startswith(
+        "Vend https://search.paypercall.dev/api/v1/web-search -> HTTP 502 after payment: "
+        "upstream unavailable -- ")
 
 
 def test_a_served_200_is_untouched_by_any_of_this(paid_calls):
@@ -487,6 +502,17 @@ def test_settled_true_says_the_payment_settled(paid_then_refused):
     assert "settled and the XNO was spent" in text
     assert "can sign a NEW payment" in text
     assert "quote this block to the seller" in text
+
+
+def test_settled_true_frames_the_library_re_present_note(paid_then_refused):
+    note = ("payment is on the ledger; if the merchant did not deliver, "
+            "re-present this SAME block - do not pay again")
+    err = _refused(paid_then_refused, dict(RECEIPT, ledger="confirmed", note=note))
+    assert err.note == note
+    text = str(err)
+    assert "(for callers that can re-present a block; this tool cannot): " + note in text
+    assert "this tool cannot re-present the block" in text
+    assert text.index(note) < text.index("can sign a NEW payment")
 
 
 def test_settled_false_says_nothing_was_paid(paid_then_refused):
@@ -522,13 +548,23 @@ def test_the_old_after_payment_text_still_matches(paid_then_refused):
     text = str(err)
     assert text.startswith(
         "Vend https://search.paypercall.dev/api/v1/web-search -> HTTP 502 after payment: ")
-    assert text.endswith("upstream unavailable")
+
+
+@pytest.mark.parametrize("receipt", [dict(RECEIPT), dict(RECEIPT, settled=False),
+                                     dict(RECEIPT, settled="indeterminate"), None])
+def test_the_seller_body_comes_right_after_the_old_prefix(paid_then_refused, receipt):
+    import re
+
+    m = re.search(r"HTTP (\d+) after payment: (.*)", str(_refused(paid_then_refused, receipt)))
+    assert m and m.group(1) == "502"
+    assert m.group(2).startswith("upstream unavailable -- ")
 
 
 def test_the_seller_body_is_still_cut_to_200_characters(paid_then_refused):
     err = tools.VendPaidButNotServed("https://x", 500, "z" * 500, RECEIPT, PRICE_RAW)
     assert err.body == "z" * 200
-    assert str(err).endswith(" " + "z" * 200)
+    assert "after payment: " + "z" * 200 + " -- " in str(err)
+    assert "z" * 201 not in str(err)
 
 
 @pytest.mark.parametrize("settled", [True, False, "indeterminate", None])
@@ -550,10 +586,23 @@ def test_the_exception_survives_pickle_and_copy(settled):
 
     receipt = dict(RECEIPT, settled=settled, ledger="absent", note="n")
     err = tools.VendPaidButNotServed("https://x/y", 502, "nope", receipt, PRICE_RAW)
-    names = ("url", "status_code", "body", "receipt", "block", "amount_raw",
+    names = ("url", "status_code", "body", "receipt", "block", "signed", "amount_raw",
              "settled", "ledger", "note", "args")
     for clone in (pickle.loads(pickle.dumps(err)), copy.copy(err), copy.deepcopy(err)):
         assert type(clone) is tools.VendPaidButNotServed
         for name in names:
             assert getattr(clone, name) == getattr(err, name), name
         assert str(clone) == str(err)
+
+
+def test_notes_and_caller_set_attributes_survive_pickle_and_copy():
+    import copy
+    import pickle
+
+    err = tools.VendPaidButNotServed("https://x/y", 502, "nope", dict(RECEIPT), PRICE_RAW)
+    err.add_note("while searching for nano")
+    err.request_id = "abc"
+    for clone in (pickle.loads(pickle.dumps(err)), copy.copy(err), copy.deepcopy(err)):
+        assert clone.__notes__ == ["while searching for nano"]
+        assert clone.request_id == "abc"
+        assert clone.block == RECEIPT["block"] and str(clone) == str(err)

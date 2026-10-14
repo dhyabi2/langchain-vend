@@ -506,29 +506,39 @@ class _VendTool(BaseTool):
 
 
 class VendPaidButNotServed(RuntimeError):
-    """A payment block was handed to the seller and the call was not served.
+    """The paying call to the seller did not come back 200.
 
     Raised instead of a bare `RuntimeError` so the settlement receipt survives
-    the failure. Whether the XNO actually moved is what the receipt's `settled`
-    says, not what the HTTP status implies: feeless402 reports True (the block
-    is on the ledger), False (the seller refused and the ledger does not hold
-    the block: nothing was paid) or "indeterminate" (neither the seller nor the
-    ledger confirmed it). A missing or unrecognised value is treated as
-    "indeterminate". Subclasses `RuntimeError`, and the message still contains
-    `after payment:`, so handlers that caught or matched the old error still do.
+    the failure. Whether the XNO actually moved is what the receipt says, not
+    what the HTTP status implies:
+
+    - no receipt, or one with no block: `request_with_payment` returns
+      `(response, None)` without signing anything when the paying read is not
+      a 402, so no payment was signed by this call (`signed` False, `settled`
+      False);
+    - otherwise feeless402's `settled`: True (the block is on the ledger: the
+      XNO was spent), False (the seller refused and the ledger does not hold
+      the block: nothing was paid) or "indeterminate" (neither the seller nor
+      the ledger confirmed it). A missing or unrecognised value is treated as
+      "indeterminate".
+
+    The message keeps main's shape, `Vend {url} -> HTTP {code} after payment:
+    {body}`, with the explanation after ` -- `, so handlers that matched the
+    old text still do; it subclasses `RuntimeError` for the same reason.
 
     This tool cannot re-present a block: its input is only the query, and a
-    second call may sign a NEW payment. Recovery is quoting `block` to the
+    second call can sign a NEW payment. Recovery is quoting `block` to the
     seller, after checking it on the ledger when `settled` is not True.
 
     Attributes:
-        url          the endpoint that was paid and did not answer
-        status_code  what it answered instead of 200
+        url          the endpoint that was called and did not answer 200
+        status_code  what it answered instead
         body         the first 200 characters of that answer
         receipt      the settlement receipt from `request_with_payment`, as-is
         block        the block hash out of that receipt, or None if it had none
-        amount_raw   integer-raw string that was quoted (and signed)
-        settled      True, False or "indeterminate", from the receipt
+        signed       whether this call signed a block (a block is in the receipt)
+        amount_raw   integer-raw string that was quoted
+        settled      True, False or "indeterminate"
         ledger       the receipt's ledger verdict, or None if it had none
         note         the library's own note from the receipt, or None
     """
@@ -541,45 +551,64 @@ class VendPaidButNotServed(RuntimeError):
         self.receipt = dict(receipt) if isinstance(receipt, dict) else {}
         block = self.receipt.get("block")
         self.block = block if isinstance(block, str) and block else None
+        self.signed = self.block is not None
         self.amount_raw = amount_raw
         settled = self.receipt.get("settled")
-        self.settled = settled if settled is True or settled is False else "indeterminate"
+        if not self.signed:
+            self.settled = False
+        elif settled is True or settled is False:
+            self.settled = settled
+        else:
+            self.settled = "indeterminate"
         ledger = self.receipt.get("ledger")
         self.ledger = ledger if isinstance(ledger, str) and ledger else None
         note = self.receipt.get("note")
         self.note = note if isinstance(note, str) and note else None
 
         block_txt = json.dumps(self.block)
-        if self.settled is True:
-            outcome = ("the payment settled and the XNO was spent, but the call "
-                       "was not served. paid ")
-        elif self.settled is False:
-            outcome = ("the library reports nothing was paid (the ledger does not "
-                       "hold the block). quoted ")
+        if not self.signed:
+            detail = ("no payment was signed for this call (no block in the "
+                      "receipt), so nothing was paid")
+            if self.note:
+                detail += ". library note: " + self.note
         else:
-            outcome = ("whether the payment settled is unknown; check block "
-                       + block_txt + " on the ledger before anything else. quoted ")
-        detail = (outcome + json.dumps(amount_raw) + " raw, block " + block_txt
-                  + ", settled " + json.dumps(self.settled)
-                  + ", ledger " + json.dumps(self.ledger))
-        if self.note:
-            detail += ". library note: " + self.note
-        if self.settled is True:
-            recover = "; to recover, quote this block to the seller (the XNO was spent)"
-        elif self.settled is False:
-            recover = ""
-        else:
-            recover = "; to recover, check the block on the ledger, then quote it to the seller"
-        detail += (". Warning: calling this tool again can sign a NEW payment"
-                   + recover)
+            if self.settled is True:
+                detail = ("the payment settled and the XNO was spent, but the "
+                          "call was not served. paid ")
+            elif self.settled is False:
+                detail = ("the library reports nothing was paid (the ledger does "
+                          "not hold the block). quoted ")
+            else:
+                detail = ("whether the payment settled is unknown; check block "
+                          + block_txt + " on the ledger before anything else. quoted ")
+            detail += (json.dumps(amount_raw) + " raw, block " + block_txt
+                       + ", settled " + json.dumps(self.settled)
+                       + ", ledger " + json.dumps(self.ledger))
+            if self.note and self.settled is True:
+                detail += (". library note (for callers that can re-present a "
+                           "block; this tool cannot): " + self.note)
+            elif self.note:
+                detail += ". library note: " + self.note
+            if self.settled is True:
+                recover = ("; to recover, quote this block to the seller "
+                           "(the XNO was spent)")
+            elif self.settled is False:
+                recover = ""
+            else:
+                recover = ("; to recover, check the block on the ledger, then "
+                           "quote it to the seller")
+            detail += (". Warning: this tool cannot re-present the block, and "
+                       "calling it again can sign a NEW payment" + recover)
         super().__init__(
             "Vend " + url + " -> HTTP " + str(status_code) + " after payment: "
-            + detail + ". seller said: " + self.body
+            + self.body + " -- " + detail
         )
 
     def __reduce__(self):
+        # The third element restores __dict__ (add_note() notes, attributes a
+        # caller set) on top of what __init__ rebuilds.
         return (type(self), (self.url, self.status_code, self.body,
-                             self.receipt, self.amount_raw))
+                             self.receipt, self.amount_raw), dict(self.__dict__))
 
 
 class Vend402Quote(Exception):
