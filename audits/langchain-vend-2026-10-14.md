@@ -96,9 +96,12 @@ message keeps main's shape, `Vend {url} -> HTTP {code} after payment: {body}`, w
 seller's body (cut to 200 characters) straight after the prefix and the explanation after
 ` -- `, so handlers matching the old text still match. With no receipt (feeless402 returns
 `(response, None)` without signing anything when the paying read is not a 402) it says no
-payment was signed for this call and names no block. Otherwise it says the XNO was spent only
-when `settled` is True, says nothing was paid when it is False, and says the outcome is
-unknown otherwise. When `settled` is True the library's "re-present this SAME block" note is
+payment was signed for this call and names no block. That is the only case where it says so:
+for a dict receipt with a block it says the XNO was spent only when `settled` is True and
+says nothing was paid only when it is False; any other receipt (an "indeterminate" or
+missing `settled`, no usable block, a non-dict receipt from a custom wallet) is reported as
+indeterminate (a payment may have been signed; check the wallet or ledger before calling
+again), and a bytes block is decoded rather than crashed on. When `settled` is True the library's "re-present this SAME block" note is
 quoted as advice for callers that can re-present a block, which this tool cannot. Every
 signed case warns that calling the tool again can make a new payment and never suggests
 putting the block in `X-PAYMENT`. It subclasses `RuntimeError`, so every handler that caught
@@ -113,7 +116,7 @@ changes: this is strictly about what survives a failure after it.
 $ pytest -q tests/test_live_payment.py -k "paid_call or block_hash or runtime_error or no_block or no_receipt or served_200"
   4 failed, 2 passed        # without the fix
 $ pytest -q
-  259 passed                # with it (was 233)
+  265 passed                # with it (was 233)
 ```
 
 The two that pass either way are deliberate: `..._still_a_runtime_error_so_existing_handlers_keep_working`

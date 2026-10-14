@@ -455,7 +455,8 @@ def test_a_receipt_with_no_block_reports_none_rather_than_inventing_one(paid_the
         tool.invoke({"q": "nano cryptocurrency"})
     assert caught.value.block is None
     assert caught.value.receipt == {"settled": False}, "the receipt we did get is still reported"
-    assert caught.value.signed is False
+    assert caught.value.signed is None
+    assert caught.value.settled == "indeterminate"
 
 
 def test_no_receipt_at_all_is_an_empty_dict_not_a_crash(paid_then_refused):
@@ -511,7 +512,7 @@ def test_settled_true_frames_the_library_re_present_note(paid_then_refused):
     assert err.note == note
     text = str(err)
     assert "(for callers that can re-present a block; this tool cannot): " + note in text
-    assert "this tool cannot re-present the block" in text
+    assert "this tool cannot re-present a block" in text
     assert text.index(note) < text.index("can sign a NEW payment")
 
 
@@ -606,3 +607,38 @@ def test_notes_and_caller_set_attributes_survive_pickle_and_copy():
         assert clone.__notes__ == ["while searching for nano"]
         assert clone.request_id == "abc"
         assert clone.block == RECEIPT["block"] and str(clone) == str(err)
+
+
+@pytest.mark.parametrize("receipt", [
+    {"settled": True, "block": ""},
+    {"settled": True, "ledger": "confirmed"},
+    {"settled": "indeterminate", "block": b"AB"},
+    ("custom", "wallet", "receipt"),
+])
+def test_a_receipt_that_may_have_paid_is_never_told_nothing_was_paid(paid_then_refused, receipt):
+    err = _refused(paid_then_refused, receipt)
+    text = str(err)
+    assert "nothing was paid" not in text
+    assert "no payment was signed" not in text
+    assert err.settled is not False
+    assert err.settled == "indeterminate"
+    assert err.signed is not False
+    assert "may have been signed" in text or "unknown" in text
+    assert "can sign a NEW payment" in text
+
+
+def test_a_bytes_block_is_rendered_not_crashed_on(paid_then_refused):
+    err = _refused(paid_then_refused, {"settled": "indeterminate", "block": b"AB"})
+    assert err.block == "AB" and err.signed is True
+    assert '"AB"' in str(err)
+
+
+def test_a_non_dict_receipt_survives_pickle_and_copy():
+    import copy
+    import pickle
+
+    for receipt in (None, ("custom",), {"settled": True, "block": ""}):
+        err = tools.VendPaidButNotServed("https://x/y", 502, "nope", receipt, PRICE_RAW)
+        for clone in (pickle.loads(pickle.dumps(err)), copy.copy(err), copy.deepcopy(err)):
+            assert str(clone) == str(err)
+            assert (clone.signed, clone.settled, clone.receipt) == (err.signed, err.settled, err.receipt)
