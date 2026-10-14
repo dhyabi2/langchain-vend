@@ -67,16 +67,21 @@ RuntimeError: Vend https://search.paypercall.dev/api/v1/web-search -> HTTP 502
               after payment: upstream unavailable
 ```
 
-The XNO is gone and the block hash that moved it is not in that sentence, not on the
-exception, and not anywhere else the caller can reach — `_run` re-raises everything but
-`Vend402Quote`, so nothing downstream sees the receipt either. Three things an agent can
-do with that hash, all of them now impossible:
+A signed block was handed to the seller, and the block hash and the library's verdict on
+it are not in that sentence, not on the exception, and not anywhere else the caller can
+reach — `_run` re-raises everything but `Vend402Quote`, so nothing downstream sees the
+receipt either. Whether the XNO actually moved is not something the status code says: in
+feeless402 0.2.13 the receipt's `settled` is True (the block is on the ledger: the XNO was
+spent), False (the seller refused and the ledger does not hold the block: nothing was paid)
+or `"indeterminate"` (neither confirmed it), with `ledger` and, when not True, a `note`.
+Things an agent can do with that receipt, all of them impossible without it:
 
-1. retry the call itself with the hash in `X-PAYMENT`, which is the whole point of the
-   three-step handshake and costs nothing more;
-2. quote it to the seller, who can look the block up on the public ledger;
-3. tell this apart from a call it never paid for — which is the one distinction that
-   decides whether paying again is a retry or a second payment.
+1. quote the block to the seller, who can look it up on the public ledger;
+2. check the block on the ledger itself when `settled` is not True;
+3. tell this apart from a call it never paid for.
+
+What it cannot do is retry for free: this tool's input is only the query, it has no way to
+re-present a block in `X-PAYMENT`, and calling it again can sign a new payment.
 
 A 502 from a proxy in front of a pay-per-call endpoint is an ordinary event, and the module
 already treats one as ordinary on the *unpaid* read (`challenge = {}` for a non-JSON 402
@@ -84,9 +89,14 @@ body, `tools.py:265`). On the paid read it was the one failure that costs money 
 with the least information.
 
 The fix raises `VendPaidButNotServed` instead, carrying `receipt`, `block`, `amount_raw`,
-`url`, `status_code` and `body`, and naming the block and the amount in the message text as
-well — a LangChain agent reads the message far more often than it introspects the
-exception. It subclasses `RuntimeError`, so every handler that caught the old error still
+`settled`, `ledger`, `note`, `url`, `status_code` and `body`, and naming the block, the
+amount and the receipt's own verdict (and note) in the message text as well — a LangChain
+agent reads the message far more often than it introspects the exception. The message says
+the XNO was spent only when `settled` is True, says nothing was paid when it is False, and
+says the outcome is unknown otherwise; it warns that calling the tool again can make a new
+payment and never suggests putting the block in `X-PAYMENT`. It keeps the old
+`... after payment: ` prefix and ends with the seller's body (cut to 200 characters), and it
+round-trips through `pickle`, `copy.copy` and `copy.deepcopy`. It subclasses `RuntimeError`, so every handler that caught the old error still
 catches this one, and it is exported from the package.
 
 Nothing about a served 200 changes, and nothing about the refusals before the money moves
@@ -96,7 +106,7 @@ changes: this is strictly about what survives a failure after it.
 $ pytest -q tests/test_live_payment.py -k "paid_call or block_hash or runtime_error or no_block or no_receipt or served_200"
   4 failed, 2 passed        # without the fix
 $ pytest -q
-  239 passed                # with it (was 233)
+  252 passed                # with it (was 233)
 ```
 
 The two that pass either way are deliberate: `..._still_a_runtime_error_so_existing_handlers_keep_working`

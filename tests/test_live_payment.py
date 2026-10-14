@@ -384,11 +384,15 @@ def test_nothing_is_signed_when_the_amount_is_raised_on_the_paying_read(rereadin
 
 # ── the seller took the money and did not serve the call ─────────────────────
 #
-# `request_with_payment` returns `(response, receipt)` and the payment has
-# ALREADY settled by the time it returns. So a non-200 here is not a failed
-# call: it is a paid call that was not answered, and the receipt is the only
-# record an agent has that its XNO left the wallet. These tests pin that the
-# record survives the failure.
+# `request_with_payment` returns `(response, receipt)` once a signed block has
+# been handed to the seller. Whether it settled is the receipt's `settled`:
+# True (on the ledger: the XNO was spent), False (refused and not on the
+# ledger: nothing was paid) or "indeterminate" (unknown: check the block on
+# the ledger first). The receipt is the only record an agent has of that block,
+# and these tests pin that it survives the failure and that the message says
+# what the receipt says. Calling the tool again can sign a NEW payment; the
+# tool has no way to re-present the block, so recovery is quoting it to the
+# seller, never a free retry.
 
 
 @pytest.fixture
@@ -420,8 +424,8 @@ def test_a_paid_call_the_seller_refused_keeps_the_settlement_receipt(paid_then_r
     err = caught.value
     assert err.receipt == RECEIPT, "the settlement receipt was dropped on a paid call"
     assert err.block == RECEIPT["block"], (
-        "the block hash that moved the XNO was lost; an agent cannot retry "
-        "X-PAYMENT or prove it paid"
+        "the block hash that moved the XNO was lost; an agent cannot quote "
+        "it to the seller or prove it paid"
     )
     assert err.amount_raw == PRICE_RAW, "the amount paid was not reported"
     assert err.status_code == 502
@@ -466,3 +470,90 @@ def test_a_served_200_is_untouched_by_any_of_this(paid_calls):
     out = json.loads(VendWebSearch(wallet=_Wallet(), dry_run=False).invoke({"q": "nano"}))
     assert out["result"] == ANSWER
     assert out["payment"]["block"] == RECEIPT["block"]
+
+
+def _refused(paid_then_refused, receipt):
+    paid_then_refused["receipt"] = receipt
+    tool = VendWebSearch(wallet=_Wallet(), dry_run=False)
+    with pytest.raises(tools.VendPaidButNotServed) as caught:
+        tool.invoke({"q": "nano cryptocurrency"})
+    return caught.value
+
+
+def test_settled_true_says_the_payment_settled(paid_then_refused):
+    err = _refused(paid_then_refused, dict(RECEIPT, ledger="confirmed"))
+    assert err.settled is True and err.ledger == "confirmed"
+    text = str(err)
+    assert "settled and the XNO was spent" in text
+    assert "can sign a NEW payment" in text
+    assert "quote this block to the seller" in text
+
+
+def test_settled_false_says_nothing_was_paid(paid_then_refused):
+    note = "merchant refused and the ledger does not hold the block; nothing was paid"
+    err = _refused(paid_then_refused, dict(RECEIPT, settled=False, ledger="absent", note=note))
+    assert err.settled is False and err.ledger == "absent" and err.note == note
+    text = str(err)
+    assert "nothing was paid" in text and note in text
+    assert "spent" not in text and "settled and" not in text
+
+
+def test_indeterminate_says_unknown_and_to_check_the_ledger(paid_then_refused):
+    note = ("no confirmation from merchant or ledger; check this block hash "
+            "before paying again - do NOT re-pay blind")
+    err = _refused(paid_then_refused, dict(RECEIPT, settled="indeterminate",
+                                           ledger="unreachable", note=note))
+    assert err.settled == "indeterminate" and err.ledger == "unreachable"
+    text = str(err)
+    assert "unknown" in text and "on the ledger before anything else" in text
+    assert note in text
+    assert "spent" not in text and "nothing was paid" not in text
+
+
+def test_a_receipt_without_settled_is_treated_as_unknown(paid_then_refused):
+    err = _refused(paid_then_refused, {"block": RECEIPT["block"]})
+    assert err.settled == "indeterminate"
+    assert err.ledger is None and err.note is None
+    assert "unknown" in str(err) and "spent" not in str(err)
+
+
+def test_the_old_after_payment_text_still_matches(paid_then_refused):
+    err = _refused(paid_then_refused, dict(RECEIPT))
+    text = str(err)
+    assert text.startswith(
+        "Vend https://search.paypercall.dev/api/v1/web-search -> HTTP 502 after payment: ")
+    assert text.endswith("upstream unavailable")
+
+
+def test_the_seller_body_is_still_cut_to_200_characters(paid_then_refused):
+    err = tools.VendPaidButNotServed("https://x", 500, "z" * 500, RECEIPT, PRICE_RAW)
+    assert err.body == "z" * 200
+    assert str(err).endswith(" " + "z" * 200)
+
+
+@pytest.mark.parametrize("settled", [True, False, "indeterminate", None])
+def test_the_message_never_says_to_put_the_block_in_x_payment(paid_then_refused, settled):
+    receipt = dict(RECEIPT)
+    if settled is None:
+        receipt.pop("settled")
+    else:
+        receipt["settled"] = settled
+    text = str(_refused(paid_then_refused, receipt))
+    assert "X-PAYMENT" not in text.upper()
+    assert "retry" not in text.lower()
+
+
+@pytest.mark.parametrize("settled", [True, False, "indeterminate"])
+def test_the_exception_survives_pickle_and_copy(settled):
+    import copy
+    import pickle
+
+    receipt = dict(RECEIPT, settled=settled, ledger="absent", note="n")
+    err = tools.VendPaidButNotServed("https://x/y", 502, "nope", receipt, PRICE_RAW)
+    names = ("url", "status_code", "body", "receipt", "block", "amount_raw",
+             "settled", "ledger", "note", "args")
+    for clone in (pickle.loads(pickle.dumps(err)), copy.copy(err), copy.deepcopy(err)):
+        assert type(clone) is tools.VendPaidButNotServed
+        for name in names:
+            assert getattr(clone, name) == getattr(err, name), name
+        assert str(clone) == str(err)

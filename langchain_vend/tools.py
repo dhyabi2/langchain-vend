@@ -457,13 +457,13 @@ class _VendTool(BaseTool):
                 params=params,
             )
             if paid.status_code != 200:
-                # The XNO has already moved. `receipt` holds the block hash that
-                # moved it, and this used to drop it on the floor: the agent got a
-                # bare RuntimeError naming the seller's status code and had no
-                # record of its own payment - nothing to retry `X-PAYMENT` with,
-                # nothing to show the seller, nothing to reconcile. A paid call the
-                # seller then refused is the one case where losing the receipt
-                # costs money, so the receipt is carried out with the failure.
+                # A block was handed to the seller and the call was not served.
+                # `receipt` holds that block and the library's verdict on whether
+                # it settled (True / False / "indeterminate"); this used to drop
+                # it, leaving the agent a bare RuntimeError and no record of its
+                # own payment - nothing to show the seller, nothing to reconcile.
+                # The receipt is carried out with the failure, and the message
+                # reports what the receipt says rather than assuming the XNO moved.
                 raise VendPaidButNotServed(
                     url, paid.status_code, paid.text[:200], receipt,
                     quote["amount_raw"],
@@ -506,14 +506,20 @@ class _VendTool(BaseTool):
 
 
 class VendPaidButNotServed(RuntimeError):
-    """The payment settled and the seller then did not serve the call.
+    """A payment block was handed to the seller and the call was not served.
 
     Raised instead of a bare `RuntimeError` so the settlement receipt survives
-    the failure. `block` is the Nano block that moved the money: it is the only
-    evidence the payment happened, it is what `X-PAYMENT` carries on a retry,
-    and once it is gone an agent cannot tell this apart from a call it never
-    paid for. Subclasses `RuntimeError`, so anything that already caught the old
-    error still catches this one.
+    the failure. Whether the XNO actually moved is what the receipt's `settled`
+    says, not what the HTTP status implies: feeless402 reports True (the block
+    is on the ledger), False (the seller refused and the ledger does not hold
+    the block: nothing was paid) or "indeterminate" (neither the seller nor the
+    ledger confirmed it). A missing or unrecognised value is treated as
+    "indeterminate". Subclasses `RuntimeError`, and the message still contains
+    `after payment:`, so handlers that caught or matched the old error still do.
+
+    This tool cannot re-present a block: its input is only the query, and a
+    second call may sign a NEW payment. Recovery is quoting `block` to the
+    seller, after checking it on the ledger when `settled` is not True.
 
     Attributes:
         url          the endpoint that was paid and did not answer
@@ -521,25 +527,59 @@ class VendPaidButNotServed(RuntimeError):
         body         the first 200 characters of that answer
         receipt      the settlement receipt from `request_with_payment`, as-is
         block        the block hash out of that receipt, or None if it had none
-        amount_raw   integer-raw string that was paid, as quoted
+        amount_raw   integer-raw string that was quoted (and signed)
+        settled      True, False or "indeterminate", from the receipt
+        ledger       the receipt's ledger verdict, or None if it had none
+        note         the library's own note from the receipt, or None
     """
 
     def __init__(self, url: str, status_code: int, body: str,
                  receipt: Optional[Dict[str, Any]], amount_raw: Optional[str]):
         self.url = url
         self.status_code = status_code
-        self.body = body
+        self.body = str(body)[:200]
         self.receipt = dict(receipt) if isinstance(receipt, dict) else {}
         block = self.receipt.get("block")
         self.block = block if isinstance(block, str) and block else None
         self.amount_raw = amount_raw
+        settled = self.receipt.get("settled")
+        self.settled = settled if settled is True or settled is False else "indeterminate"
+        ledger = self.receipt.get("ledger")
+        self.ledger = ledger if isinstance(ledger, str) and ledger else None
+        note = self.receipt.get("note")
+        self.note = note if isinstance(note, str) and note else None
+
+        block_txt = json.dumps(self.block)
+        if self.settled is True:
+            outcome = ("the payment settled and the XNO was spent, but the call "
+                       "was not served. paid ")
+        elif self.settled is False:
+            outcome = ("the library reports nothing was paid (the ledger does not "
+                       "hold the block). quoted ")
+        else:
+            outcome = ("whether the payment settled is unknown; check block "
+                       + block_txt + " on the ledger before anything else. quoted ")
+        detail = (outcome + json.dumps(amount_raw) + " raw, block " + block_txt
+                  + ", settled " + json.dumps(self.settled)
+                  + ", ledger " + json.dumps(self.ledger))
+        if self.note:
+            detail += ". library note: " + self.note
+        if self.settled is True:
+            recover = "; to recover, quote this block to the seller (the XNO was spent)"
+        elif self.settled is False:
+            recover = ""
+        else:
+            recover = "; to recover, check the block on the ledger, then quote it to the seller"
+        detail += (". Warning: calling this tool again can sign a NEW payment"
+                   + recover)
         super().__init__(
-            "Vend " + url + " -> HTTP " + str(status_code)
-            + " AFTER the payment settled; the XNO is spent. paid "
-            + json.dumps(amount_raw) + " raw, block " + json.dumps(self.block)
-            + " (retry with this block in X-PAYMENT, or quote it to the seller)"
-            + ": " + str(body)
+            "Vend " + url + " -> HTTP " + str(status_code) + " after payment: "
+            + detail + ". seller said: " + self.body
         )
+
+    def __reduce__(self):
+        return (type(self), (self.url, self.status_code, self.body,
+                             self.receipt, self.amount_raw))
 
 
 class Vend402Quote(Exception):
