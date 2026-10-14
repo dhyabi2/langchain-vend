@@ -380,3 +380,276 @@ def test_nothing_is_signed_when_the_amount_is_raised_on_the_paying_read(rereadin
     with pytest.raises(RuntimeError, match="PriceCapExceeded"):
         VendWebSearch(wallet=wallet, dry_run=False).invoke({"q": "nano"})
     assert wallet.signed == []
+
+
+# ── the seller took the money and did not serve the call ─────────────────────
+#
+# `request_with_payment` returns `(response, receipt)` once a signed block has
+# been handed to the seller. Whether it settled is the receipt's `settled`:
+# True (on the ledger: the XNO was spent), False (refused and not on the
+# ledger: nothing was paid) or "indeterminate" (unknown: check the block on
+# the ledger first). The receipt is the only record an agent has of that block,
+# and these tests pin that it survives the failure and that the message says
+# what the receipt says. Calling the tool again can sign a NEW payment; the
+# tool has no way to re-present the block, so recovery is quoting it to the
+# seller, never a free retry.
+
+
+@pytest.fixture
+def paid_then_refused(monkeypatch):
+    """Settle the payment, then answer the paid call with the given status."""
+    state = {"status": 502, "payload": None, "receipt": dict(RECEIPT)}
+
+    def request_with_payment(method, url, wallet, rpc, max_raw, headers=None,
+                             dry_run=False, prework=False, **req_kwargs):
+        resp = _Resp(state["status"], state["payload"])
+        resp.text = "upstream unavailable"
+        return resp, state["receipt"]
+
+    x402 = types.ModuleType("nano_pay.x402")
+    x402.request_with_payment = request_with_payment
+    rpc_mod = types.ModuleType("nano_pay.rpc")
+    rpc_mod.RPC = type("RPC", (), {})
+    monkeypatch.setitem(sys.modules, "nano_pay", types.ModuleType("nano_pay"))
+    monkeypatch.setitem(sys.modules, "nano_pay.x402", x402)
+    monkeypatch.setitem(sys.modules, "nano_pay.rpc", rpc_mod)
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _Resp(402, VEND_402))
+    return state
+
+
+def test_a_paid_call_the_seller_refused_keeps_the_settlement_receipt(paid_then_refused):
+    tool = VendWebSearch(wallet=_Wallet(), dry_run=False)
+    with pytest.raises(tools.VendPaidButNotServed) as caught:
+        tool.invoke({"q": "nano cryptocurrency"})
+    err = caught.value
+    assert err.receipt == RECEIPT, "the settlement receipt was dropped on a paid call"
+    assert err.block == RECEIPT["block"], (
+        "the block hash that moved the XNO was lost; an agent cannot quote "
+        "it to the seller or prove it paid"
+    )
+    assert err.amount_raw == PRICE_RAW, "the amount paid was not reported"
+    assert err.status_code == 502
+    assert err.url == "https://search.paypercall.dev/api/v1/web-search"
+
+
+def test_the_block_hash_is_in_the_message_an_agent_actually_reads(paid_then_refused):
+    tool = VendWebSearch(wallet=_Wallet(), dry_run=False)
+    with pytest.raises(tools.VendPaidButNotServed) as caught:
+        tool.invoke({"q": "nano cryptocurrency"})
+    text = str(caught.value)
+    assert RECEIPT["block"] in text, "the one irreplaceable fact is not in the error text"
+    assert PRICE_RAW in text
+    assert "502" in text and "upstream unavailable" in text
+
+
+def test_it_is_still_a_runtime_error_so_existing_handlers_keep_working(paid_then_refused):
+    tool = VendWebSearch(wallet=_Wallet(), dry_run=False)
+    with pytest.raises(RuntimeError):
+        tool.invoke({"q": "nano cryptocurrency"})
+
+
+def test_a_receipt_with_no_block_reports_none_rather_than_inventing_one(paid_then_refused):
+    paid_then_refused["receipt"] = {"settled": False}
+    tool = VendWebSearch(wallet=_Wallet(), dry_run=False)
+    with pytest.raises(tools.VendPaidButNotServed) as caught:
+        tool.invoke({"q": "nano cryptocurrency"})
+    assert caught.value.block is None
+    assert caught.value.receipt == {"settled": False}, "the receipt we did get is still reported"
+    assert caught.value.signed is None
+    assert caught.value.settled == "indeterminate"
+
+
+def test_no_receipt_at_all_is_an_empty_dict_not_a_crash(paid_then_refused):
+    paid_then_refused["receipt"] = None
+    tool = VendWebSearch(wallet=_Wallet(), dry_run=False)
+    with pytest.raises(tools.VendPaidButNotServed) as caught:
+        tool.invoke({"q": "nano cryptocurrency"})
+    assert caught.value.receipt == {}
+    assert caught.value.block is None
+
+
+def test_no_receipt_says_no_payment_was_signed_and_names_no_null_block(paid_then_refused):
+    # feeless402 returns (response, None) without signing when the paying read
+    # is not a 402: nothing was paid, and there is no block to check.
+    err = _refused(paid_then_refused, None)
+    assert err.signed is False and err.settled is False
+    text = str(err)
+    assert "no payment was signed for this call" in text
+    assert "null" not in text and "None" not in text
+    assert "ledger" not in text and "unknown" not in text and "spent" not in text
+    assert text.startswith(
+        "Vend https://search.paypercall.dev/api/v1/web-search -> HTTP 502 after payment: "
+        "upstream unavailable -- ")
+
+
+def test_a_served_200_is_untouched_by_any_of_this(paid_calls):
+    out = json.loads(VendWebSearch(wallet=_Wallet(), dry_run=False).invoke({"q": "nano"}))
+    assert out["result"] == ANSWER
+    assert out["payment"]["block"] == RECEIPT["block"]
+
+
+def _refused(paid_then_refused, receipt):
+    paid_then_refused["receipt"] = receipt
+    tool = VendWebSearch(wallet=_Wallet(), dry_run=False)
+    with pytest.raises(tools.VendPaidButNotServed) as caught:
+        tool.invoke({"q": "nano cryptocurrency"})
+    return caught.value
+
+
+def test_settled_true_says_the_payment_settled(paid_then_refused):
+    err = _refused(paid_then_refused, dict(RECEIPT, ledger="confirmed"))
+    assert err.settled is True and err.ledger == "confirmed"
+    text = str(err)
+    assert "settled and the XNO was spent" in text
+    assert "can sign a NEW payment" in text
+    assert "quote this block to the seller" in text
+
+
+def test_settled_true_frames_the_library_re_present_note(paid_then_refused):
+    note = ("payment is on the ledger; if the merchant did not deliver, "
+            "re-present this SAME block - do not pay again")
+    err = _refused(paid_then_refused, dict(RECEIPT, ledger="confirmed", note=note))
+    assert err.note == note
+    text = str(err)
+    assert "(for callers that can re-present a block; this tool cannot): " + note in text
+    assert "this tool cannot re-present a block" in text
+    assert text.index(note) < text.index("can sign a NEW payment")
+
+
+def test_settled_false_says_nothing_was_paid(paid_then_refused):
+    note = "merchant refused and the ledger does not hold the block; nothing was paid"
+    err = _refused(paid_then_refused, dict(RECEIPT, settled=False, ledger="absent", note=note))
+    assert err.settled is False and err.ledger == "absent" and err.note == note
+    text = str(err)
+    assert "nothing was paid" in text and note in text
+    assert "spent" not in text and "settled and" not in text
+
+
+def test_indeterminate_says_unknown_and_to_check_the_ledger(paid_then_refused):
+    note = ("no confirmation from merchant or ledger; check this block hash "
+            "before paying again - do NOT re-pay blind")
+    err = _refused(paid_then_refused, dict(RECEIPT, settled="indeterminate",
+                                           ledger="unreachable", note=note))
+    assert err.settled == "indeterminate" and err.ledger == "unreachable"
+    text = str(err)
+    assert "unknown" in text and "on the ledger before anything else" in text
+    assert note in text
+    assert "spent" not in text and "nothing was paid" not in text
+
+
+def test_a_receipt_without_settled_is_treated_as_unknown(paid_then_refused):
+    err = _refused(paid_then_refused, {"block": RECEIPT["block"]})
+    assert err.settled == "indeterminate"
+    assert err.ledger is None and err.note is None
+    assert "unknown" in str(err) and "spent" not in str(err)
+
+
+def test_the_old_after_payment_text_still_matches(paid_then_refused):
+    err = _refused(paid_then_refused, dict(RECEIPT))
+    text = str(err)
+    assert text.startswith(
+        "Vend https://search.paypercall.dev/api/v1/web-search -> HTTP 502 after payment: ")
+
+
+@pytest.mark.parametrize("receipt", [dict(RECEIPT), dict(RECEIPT, settled=False),
+                                     dict(RECEIPT, settled="indeterminate"), None])
+def test_the_seller_body_comes_right_after_the_old_prefix(paid_then_refused, receipt):
+    import re
+
+    m = re.search(r"HTTP (\d+) after payment: (.*)", str(_refused(paid_then_refused, receipt)))
+    assert m and m.group(1) == "502"
+    assert m.group(2).startswith("upstream unavailable -- ")
+
+
+def test_the_seller_body_is_still_cut_to_200_characters(paid_then_refused):
+    err = tools.VendPaidButNotServed("https://x", 500, "z" * 500, RECEIPT, PRICE_RAW)
+    assert err.body == "z" * 200
+    assert "after payment: " + "z" * 200 + " -- " in str(err)
+    assert "z" * 201 not in str(err)
+
+
+@pytest.mark.parametrize("settled", [True, False, "indeterminate", None])
+def test_the_message_never_says_to_put_the_block_in_x_payment(paid_then_refused, settled):
+    receipt = dict(RECEIPT)
+    if settled is None:
+        receipt.pop("settled")
+    else:
+        receipt["settled"] = settled
+    text = str(_refused(paid_then_refused, receipt))
+    assert "X-PAYMENT" not in text.upper()
+    assert "retry" not in text.lower()
+
+
+@pytest.mark.parametrize("settled", [True, False, "indeterminate"])
+def test_the_exception_survives_pickle_and_copy(settled):
+    import copy
+    import pickle
+
+    receipt = dict(RECEIPT, settled=settled, ledger="absent", note="n")
+    err = tools.VendPaidButNotServed("https://x/y", 502, "nope", receipt, PRICE_RAW)
+    names = ("url", "status_code", "body", "receipt", "block", "signed", "amount_raw",
+             "settled", "ledger", "note", "args")
+    for clone in (pickle.loads(pickle.dumps(err)), copy.copy(err), copy.deepcopy(err)):
+        assert type(clone) is tools.VendPaidButNotServed
+        for name in names:
+            assert getattr(clone, name) == getattr(err, name), name
+        assert str(clone) == str(err)
+
+
+def test_notes_and_caller_set_attributes_survive_pickle_and_copy():
+    import copy
+    import pickle
+
+    err = tools.VendPaidButNotServed("https://x/y", 502, "nope", dict(RECEIPT), PRICE_RAW)
+    # `BaseException.add_note` is PEP 678, Python 3.11+. pyproject declares
+    # `requires-python = ">=3.10"` and CI runs a 3.10 leg, where calling it
+    # raises AttributeError before this test asserts anything - which is how it
+    # failed: `'VendPaidButNotServed' object has no attribute 'add_note'`, on
+    # 3.10 only, with 3.11/3.12/3.13 green. There is no `__notes__` to carry on
+    # 3.10, so that half of the claim is checked where the API exists; an
+    # attribute a caller sets is carried on every version and is checked on all
+    # of them. Both halves need the third element of `__reduce__`.
+    has_notes = hasattr(err, "add_note")
+    if has_notes:
+        err.add_note("while searching for nano")
+    err.request_id = "abc"
+    for clone in (pickle.loads(pickle.dumps(err)), copy.copy(err), copy.deepcopy(err)):
+        if has_notes:
+            assert clone.__notes__ == ["while searching for nano"]
+        assert clone.request_id == "abc"
+        assert clone.block == RECEIPT["block"] and str(clone) == str(err)
+
+
+@pytest.mark.parametrize("receipt", [
+    {"settled": True, "block": ""},
+    {"settled": True, "ledger": "confirmed"},
+    {"settled": "indeterminate", "block": b"AB"},
+    ("custom", "wallet", "receipt"),
+])
+def test_a_receipt_that_may_have_paid_is_never_told_nothing_was_paid(paid_then_refused, receipt):
+    err = _refused(paid_then_refused, receipt)
+    text = str(err)
+    assert "nothing was paid" not in text
+    assert "no payment was signed" not in text
+    assert err.settled is not False
+    assert err.settled == "indeterminate"
+    assert err.signed is not False
+    assert "may have been signed" in text or "unknown" in text
+    assert "can sign a NEW payment" in text
+
+
+def test_a_bytes_block_is_rendered_not_crashed_on(paid_then_refused):
+    err = _refused(paid_then_refused, {"settled": "indeterminate", "block": b"AB"})
+    assert err.block == "AB" and err.signed is True
+    assert '"AB"' in str(err)
+
+
+def test_a_non_dict_receipt_survives_pickle_and_copy():
+    import copy
+    import pickle
+
+    for receipt in (None, ("custom",), {"settled": True, "block": ""}):
+        err = tools.VendPaidButNotServed("https://x/y", 502, "nope", receipt, PRICE_RAW)
+        for clone in (pickle.loads(pickle.dumps(err)), copy.copy(err), copy.deepcopy(err)):
+            assert str(clone) == str(err)
+            assert (clone.signed, clone.settled, clone.receipt) == (err.signed, err.settled, err.receipt)

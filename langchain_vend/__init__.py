@@ -5,6 +5,7 @@ from .tools import (
     VendGeoIP,
     VendWebSearch,
     Vend402Quote,
+    VendPaidButNotServed,
     VEND_TREASURY_DEFAULT,
     raw_to_xno,
 )
@@ -15,6 +16,7 @@ __all__ = [
     "VendGeoIP",
     "VendWebSearch",
     "Vend402Quote",
+    "VendPaidButNotServed",
     "VEND_TREASURY_DEFAULT",
     "RAW_PER_XNO",
     "raw_to_xno",
