@@ -601,10 +601,21 @@ def test_notes_and_caller_set_attributes_survive_pickle_and_copy():
     import pickle
 
     err = tools.VendPaidButNotServed("https://x/y", 502, "nope", dict(RECEIPT), PRICE_RAW)
-    err.add_note("while searching for nano")
+    # `BaseException.add_note` is PEP 678, Python 3.11+. pyproject declares
+    # `requires-python = ">=3.10"` and CI runs a 3.10 leg, where calling it
+    # raises AttributeError before this test asserts anything - which is how it
+    # failed: `'VendPaidButNotServed' object has no attribute 'add_note'`, on
+    # 3.10 only, with 3.11/3.12/3.13 green. There is no `__notes__` to carry on
+    # 3.10, so that half of the claim is checked where the API exists; an
+    # attribute a caller sets is carried on every version and is checked on all
+    # of them. Both halves need the third element of `__reduce__`.
+    has_notes = hasattr(err, "add_note")
+    if has_notes:
+        err.add_note("while searching for nano")
     err.request_id = "abc"
     for clone in (pickle.loads(pickle.dumps(err)), copy.copy(err), copy.deepcopy(err)):
-        assert clone.__notes__ == ["while searching for nano"]
+        if has_notes:
+            assert clone.__notes__ == ["while searching for nano"]
         assert clone.request_id == "abc"
         assert clone.block == RECEIPT["block"] and str(clone) == str(err)
 
