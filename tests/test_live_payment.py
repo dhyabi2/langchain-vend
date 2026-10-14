@@ -380,3 +380,89 @@ def test_nothing_is_signed_when_the_amount_is_raised_on_the_paying_read(rereadin
     with pytest.raises(RuntimeError, match="PriceCapExceeded"):
         VendWebSearch(wallet=wallet, dry_run=False).invoke({"q": "nano"})
     assert wallet.signed == []
+
+
+# ── the seller took the money and did not serve the call ─────────────────────
+#
+# `request_with_payment` returns `(response, receipt)` and the payment has
+# ALREADY settled by the time it returns. So a non-200 here is not a failed
+# call: it is a paid call that was not answered, and the receipt is the only
+# record an agent has that its XNO left the wallet. These tests pin that the
+# record survives the failure.
+
+
+@pytest.fixture
+def paid_then_refused(monkeypatch):
+    """Settle the payment, then answer the paid call with the given status."""
+    state = {"status": 502, "payload": None, "receipt": dict(RECEIPT)}
+
+    def request_with_payment(method, url, wallet, rpc, max_raw, headers=None,
+                             dry_run=False, prework=False, **req_kwargs):
+        resp = _Resp(state["status"], state["payload"])
+        resp.text = "upstream unavailable"
+        return resp, state["receipt"]
+
+    x402 = types.ModuleType("nano_pay.x402")
+    x402.request_with_payment = request_with_payment
+    rpc_mod = types.ModuleType("nano_pay.rpc")
+    rpc_mod.RPC = type("RPC", (), {})
+    monkeypatch.setitem(sys.modules, "nano_pay", types.ModuleType("nano_pay"))
+    monkeypatch.setitem(sys.modules, "nano_pay.x402", x402)
+    monkeypatch.setitem(sys.modules, "nano_pay.rpc", rpc_mod)
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _Resp(402, VEND_402))
+    return state
+
+
+def test_a_paid_call_the_seller_refused_keeps_the_settlement_receipt(paid_then_refused):
+    tool = VendWebSearch(wallet=_Wallet(), dry_run=False)
+    with pytest.raises(tools.VendPaidButNotServed) as caught:
+        tool.invoke({"q": "nano cryptocurrency"})
+    err = caught.value
+    assert err.receipt == RECEIPT, "the settlement receipt was dropped on a paid call"
+    assert err.block == RECEIPT["block"], (
+        "the block hash that moved the XNO was lost; an agent cannot retry "
+        "X-PAYMENT or prove it paid"
+    )
+    assert err.amount_raw == PRICE_RAW, "the amount paid was not reported"
+    assert err.status_code == 502
+    assert err.url == "https://search.paypercall.dev/api/v1/web-search"
+
+
+def test_the_block_hash_is_in_the_message_an_agent_actually_reads(paid_then_refused):
+    tool = VendWebSearch(wallet=_Wallet(), dry_run=False)
+    with pytest.raises(tools.VendPaidButNotServed) as caught:
+        tool.invoke({"q": "nano cryptocurrency"})
+    text = str(caught.value)
+    assert RECEIPT["block"] in text, "the one irreplaceable fact is not in the error text"
+    assert PRICE_RAW in text
+    assert "502" in text and "upstream unavailable" in text
+
+
+def test_it_is_still_a_runtime_error_so_existing_handlers_keep_working(paid_then_refused):
+    tool = VendWebSearch(wallet=_Wallet(), dry_run=False)
+    with pytest.raises(RuntimeError):
+        tool.invoke({"q": "nano cryptocurrency"})
+
+
+def test_a_receipt_with_no_block_reports_none_rather_than_inventing_one(paid_then_refused):
+    paid_then_refused["receipt"] = {"settled": False}
+    tool = VendWebSearch(wallet=_Wallet(), dry_run=False)
+    with pytest.raises(tools.VendPaidButNotServed) as caught:
+        tool.invoke({"q": "nano cryptocurrency"})
+    assert caught.value.block is None
+    assert caught.value.receipt == {"settled": False}, "the receipt we did get is still reported"
+
+
+def test_no_receipt_at_all_is_an_empty_dict_not_a_crash(paid_then_refused):
+    paid_then_refused["receipt"] = None
+    tool = VendWebSearch(wallet=_Wallet(), dry_run=False)
+    with pytest.raises(tools.VendPaidButNotServed) as caught:
+        tool.invoke({"q": "nano cryptocurrency"})
+    assert caught.value.receipt == {}
+    assert caught.value.block is None
+
+
+def test_a_served_200_is_untouched_by_any_of_this(paid_calls):
+    out = json.loads(VendWebSearch(wallet=_Wallet(), dry_run=False).invoke({"q": "nano"}))
+    assert out["result"] == ANSWER
+    assert out["payment"]["block"] == RECEIPT["block"]

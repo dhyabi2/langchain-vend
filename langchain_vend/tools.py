@@ -457,8 +457,16 @@ class _VendTool(BaseTool):
                 params=params,
             )
             if paid.status_code != 200:
-                raise RuntimeError(
-                    f"Vend {url} -> HTTP {paid.status_code} after payment: {paid.text[:200]}"
+                # The XNO has already moved. `receipt` holds the block hash that
+                # moved it, and this used to drop it on the floor: the agent got a
+                # bare RuntimeError naming the seller's status code and had no
+                # record of its own payment - nothing to retry `X-PAYMENT` with,
+                # nothing to show the seller, nothing to reconcile. A paid call the
+                # seller then refused is the one case where losing the receipt
+                # costs money, so the receipt is carried out with the failure.
+                raise VendPaidButNotServed(
+                    url, paid.status_code, paid.text[:200], receipt,
+                    quote["amount_raw"],
                 )
             return {"result": paid.json(), "payment": receipt or {}}
         if resp.status_code != 200:
@@ -495,6 +503,43 @@ class _VendTool(BaseTool):
                 "See asset/network for the rail the seller asked for."
             ),
         })
+
+
+class VendPaidButNotServed(RuntimeError):
+    """The payment settled and the seller then did not serve the call.
+
+    Raised instead of a bare `RuntimeError` so the settlement receipt survives
+    the failure. `block` is the Nano block that moved the money: it is the only
+    evidence the payment happened, it is what `X-PAYMENT` carries on a retry,
+    and once it is gone an agent cannot tell this apart from a call it never
+    paid for. Subclasses `RuntimeError`, so anything that already caught the old
+    error still catches this one.
+
+    Attributes:
+        url          the endpoint that was paid and did not answer
+        status_code  what it answered instead of 200
+        body         the first 200 characters of that answer
+        receipt      the settlement receipt from `request_with_payment`, as-is
+        block        the block hash out of that receipt, or None if it had none
+        amount_raw   integer-raw string that was paid, as quoted
+    """
+
+    def __init__(self, url: str, status_code: int, body: str,
+                 receipt: Optional[Dict[str, Any]], amount_raw: Optional[str]):
+        self.url = url
+        self.status_code = status_code
+        self.body = body
+        self.receipt = dict(receipt) if isinstance(receipt, dict) else {}
+        block = self.receipt.get("block")
+        self.block = block if isinstance(block, str) and block else None
+        self.amount_raw = amount_raw
+        super().__init__(
+            "Vend " + url + " -> HTTP " + str(status_code)
+            + " AFTER the payment settled; the XNO is spent. paid "
+            + json.dumps(amount_raw) + " raw, block " + json.dumps(self.block)
+            + " (retry with this block in X-PAYMENT, or quote it to the seller)"
+            + ": " + str(body)
+        )
 
 
 class Vend402Quote(Exception):
@@ -544,5 +589,6 @@ class VendGeoIP(_VendTool):
     _endpoint: str = VEND_ENDPOINTS["geoip"][0]
 
 
-__all__ = ["VendWebSearch", "VendExtract", "VendGeoIP", "Vend402Quote", "VEND_TREASURY_DEFAULT",
+__all__ = ["VendWebSearch", "VendExtract", "VendGeoIP", "Vend402Quote", "VendPaidButNotServed",
+           "VEND_TREASURY_DEFAULT",
            "RAW_PER_XNO", "raw_to_xno"]
