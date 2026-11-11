@@ -85,6 +85,10 @@ NUMERIC_TEXT = re.compile(r"^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?
 #: any pattern or `Decimal()` reads it.
 MAX_NUMERIC_TEXT = 100
 
+#: A paid 200 whose body is not JSON is returned as text, cut to this many
+#: characters, next to its settlement receipt (see `_call_vend`).
+MAX_NON_JSON_RESULT = 20000
+
 
 def _numeric_text(text: str):
     """`NUMERIC_TEXT.match(text)`, or None for text too long to be a price."""
@@ -378,7 +382,9 @@ class _VendTool(BaseTool):
 
     Without a wallet the tool quotes and spends nothing. With a wallet it pays
     the quoted XNO amount and returns the merchant's answer together with the
-    settlement receipt: ``{"result": ..., "payment": {...}}``. Pass
+    settlement receipt: ``{"result": ..., "payment": {...}}``. A paid answer
+    that is not JSON comes back as text with ``"result_is_json": False`` and
+    ``"result_truncated"``, and the same receipt. Pass
     ``dry_run=True`` to hold a wallet and still only read the price.
     """
 
@@ -468,7 +474,27 @@ class _VendTool(BaseTool):
                     url, paid.status_code, paid.text[:200], receipt,
                     quote["amount_raw"],
                 )
-            return {"result": paid.json(), "payment": receipt or {}}
+            # A 200 here is a call that was paid for AND served. When its body is
+            # not JSON (plain text, an HTML page, an empty body, bytes that do
+            # not decode) `paid.json()` raised out of the tool and the receipt
+            # went with it: the agent had paid, held no block hash, and calling
+            # again signs a NEW payment. The served text is returned instead,
+            # cut to `MAX_NON_JSON_RESULT` characters, with the same receipt.
+            try:
+                result = paid.json()
+            except (ValueError, RecursionError):
+                try:
+                    text = paid.text
+                except Exception:
+                    text = bytes(paid.content).decode("utf-8", "replace")
+                text = str(text)
+                return {
+                    "result": text[:MAX_NON_JSON_RESULT],
+                    "result_is_json": False,
+                    "result_truncated": len(text) > MAX_NON_JSON_RESULT,
+                    "payment": receipt or {},
+                }
+            return {"result": result, "payment": receipt or {}}
         if resp.status_code != 200:
             raise RuntimeError(f"Vend {self._endpoint} -> HTTP {resp.status_code}: {resp.text[:200]}")
         return resp.json()

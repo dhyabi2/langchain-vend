@@ -653,3 +653,80 @@ def test_a_non_dict_receipt_survives_pickle_and_copy():
         for clone in (pickle.loads(pickle.dumps(err)), copy.copy(err), copy.deepcopy(err)):
             assert str(clone) == str(err)
             assert (clone.signed, clone.settled, clone.receipt) == (err.signed, err.settled, err.receipt)
+
+
+# ── the seller served the paid call, but not as JSON ─────────────────────────
+#
+# A paid 200 is the seller's answer to a call that was already paid for. When
+# its body is not JSON (plain text, an HTML page, nothing at all) `paid.json()`
+# raised out of the tool and took the receipt with it: the agent had paid,
+# held no block hash to show for it, and calling again signs a NEW payment.
+# The served text is now returned, bounded, alongside the same receipt a JSON
+# answer gets.
+
+
+@pytest.fixture
+def paid_non_json(monkeypatch):
+    """Settle the payment, then serve the paid call as a real httpx 200."""
+    state = {"response": httpx.Response(200, text="plain text, not JSON"),
+             "receipt": dict(RECEIPT)}
+
+    def request_with_payment(method, url, wallet, rpc, max_raw, headers=None,
+                             dry_run=False, prework=False, **req_kwargs):
+        return state["response"], state["receipt"]
+
+    x402 = types.ModuleType("nano_pay.x402")
+    x402.request_with_payment = request_with_payment
+    rpc_mod = types.ModuleType("nano_pay.rpc")
+    rpc_mod.RPC = type("RPC", (), {})
+    monkeypatch.setitem(sys.modules, "nano_pay", types.ModuleType("nano_pay"))
+    monkeypatch.setitem(sys.modules, "nano_pay.x402", x402)
+    monkeypatch.setitem(sys.modules, "nano_pay.rpc", rpc_mod)
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _Resp(402, VEND_402))
+    return state
+
+
+@pytest.mark.parametrize("response", [
+    httpx.Response(200, text="plain text, not JSON"),
+    httpx.Response(200, html="<html><body>served</body></html>"),
+    httpx.Response(200, content=b""),
+    httpx.Response(200, content=b"\xff\xfe\x00garbage",
+                   headers={"content-type": "application/json"}),
+    httpx.Response(200, content=b"[" * 100000),
+], ids=["text", "html", "empty", "undecodable", "too-deep"])
+def test_a_paid_non_json_200_still_returns_the_receipt(paid_non_json, response):
+    paid_non_json["response"] = response
+    out = json.loads(VendWebSearch(wallet=_Wallet(), dry_run=False).invoke({"q": "nano"}))
+    assert out["payment"] == RECEIPT, (
+        "the call was paid and served, and the receipt was lost with the body")
+    assert out["payment"]["block"] == RECEIPT["block"]
+    assert out["result_is_json"] is False
+    assert isinstance(out["result"], str)
+
+
+def test_the_served_text_is_returned_as_the_result(paid_non_json):
+    out = json.loads(VendWebSearch(wallet=_Wallet(), dry_run=False).invoke({"q": "nano"}))
+    assert out["result"] == "plain text, not JSON"
+    assert out["result_truncated"] is False
+
+
+def test_the_served_text_is_bounded(paid_non_json):
+    limit = tools.MAX_NON_JSON_RESULT
+    paid_non_json["response"] = httpx.Response(200, text="x" * (limit * 3))
+    out = json.loads(VendWebSearch(wallet=_Wallet(), dry_run=False).invoke({"q": "nano"}))
+    assert out["result"] == "x" * limit
+    assert out["result_truncated"] is True
+    assert out["payment"]["block"] == RECEIPT["block"]
+
+
+def test_no_receipt_on_a_non_json_200_is_an_empty_dict_not_a_crash(paid_non_json):
+    paid_non_json["receipt"] = None
+    out = json.loads(VendWebSearch(wallet=_Wallet(), dry_run=False).invoke({"q": "nano"}))
+    assert out["payment"] == {}
+    assert out["result"] == "plain text, not JSON"
+
+
+def test_a_json_200_keeps_its_shape(paid_non_json):
+    paid_non_json["response"] = httpx.Response(200, json=ANSWER)
+    out = json.loads(VendWebSearch(wallet=_Wallet(), dry_run=False).invoke({"q": "nano"}))
+    assert out == {"result": ANSWER, "payment": RECEIPT}
