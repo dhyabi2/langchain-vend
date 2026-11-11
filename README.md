@@ -10,10 +10,11 @@ server answers.
 ## Install
 
 ```bash
-pip install "langchain-vend[live] @ git+https://github.com/dhyabi2/langchain-vend.git"
+pip install "langchain-vend[live] @ git+https://github.com/dhyabi2/langchain-vend.git@9e5756b1a01bf39c61b9c7265ca4f98f46c2475c"
 ```
 
-(base install is `git+...langchain-vend.git`; the `[live]` extra adds `nano_pay` for
+(pinned to a tested commit: the only tag, v0.1.0, predates the quote and spend-cap fixes #5-#11;
+base install is `git+...langchain-vend.git@<commit>`; the `[live]` extra adds `nano_pay` for
 the live x402 payment handshake). A PyPI release is tracked separately.
 
 ## Tools
